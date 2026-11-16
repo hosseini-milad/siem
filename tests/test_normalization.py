@@ -48,7 +48,10 @@ def test_global_scaling_encoding_and_source_preservation(setup):
     for row in rows:
         assert all(isinstance(v, (int, float)) and 0 <= v <= 1 for k, v in row.items() if k not in {'_id', 'original_id'})
     assert list(db.dataset_records.find()) == source
-    assert run(client)['status'] == 'completed'
+    repeated = run(client)
+    assert repeated['status'] == 'completed'
+    assert repeated['processed'] == 0 and repeated['skipped'] == 3
+    assert list(db.normal_records.find().sort('_id', 1)) == rows
     assert db.normal_records.count_documents({}) == 3
     assert client.get('/api/v1/normalization/records?limit=1').json()['total'] == 3
     assert client.get('/api/v1/normalization/runs/' + str(uuid4())).status_code == 404
@@ -71,12 +74,40 @@ def test_failure_preserves_previous_output_and_lock(setup):
         client.app.state.import_lock.release()
 
 
-def test_scaling_across_batches_and_atomic_replacement(setup):
+def test_scaling_across_batches(setup):
     client, db = setup
-    db.normal_records.insert_one({'_id': 'stale'})
     db.dataset_records.insert_many([{'_id': str(i), 'Label': 'benign', 'value': str(i)} for i in range(501)])
     assert run(client)['status'] == 'completed'
     assert db.normal_records.count_documents({}) == 501
-    assert db.normal_records.find_one({'_id': 'stale'}) is None
     assert db.normal_records.find_one({'_id': '250'})['value'] == 0.5
     assert db.normal_records.find_one({'_id': '500'})['value'] == 1
+
+
+def test_incremental_uses_frozen_schema_and_preserves_existing(setup):
+    client, db = setup
+    db.dataset_records.insert_many([{'_id': 'a', 'Label': 'benign', 'value': '0'},
+                                    {'_id': 'b', 'Label': 'attack', 'value': '10'}])
+    assert run(client)['processed'] == 2
+    before = list(db.normal_records.find().sort('_id', 1))
+    # A changed already-normalized source must not even be validated again.
+    db.dataset_records.update_one({'_id': 'a'}, {'$set': {'Label': ''}})
+    db.dataset_records.insert_many([{'_id': 'c', 'Label': 'benign', 'value': '5'},
+                                    {'_id': 'd', 'Label': 'attack', 'value': '20'}])
+    status = run(client)
+    assert status['status'] == 'completed'
+    assert status['processed'] == 2 and status['skipped'] == 2
+    assert list(db.normal_records.find({'_id': {'$in': ['a', 'b']}}).sort('_id', 1)) == before
+    assert db.normal_records.find_one({'_id': 'c'})['value'] == 0.5
+    assert db.normal_records.find_one({'_id': 'd'})['value'] == 1
+
+
+def test_reuses_previous_release_schema(setup):
+    client, db = setup
+    db.dataset_records.insert_one({'_id': 'a', 'Label': 'benign', 'value': '10'})
+    first = run(client)
+    db.normalization_parameters.delete_many({})
+    db.dataset_records.insert_one({'_id': 'b', 'Label': 'attack', 'value': '100'})
+    status = run(client)
+    assert status['status'] == 'completed'
+    assert status['schema'] == first['schema']
+    assert status['processed'] == 1 and status['skipped'] == 1

@@ -9,14 +9,14 @@ from app.services.normalization import normalize
 router = APIRouter(prefix='/api/v1/normalization', tags=['Normalization'])
 
 
-@router.post('/runs', status_code=202, summary='نرمال‌سازی کل dataset_records و جایگزینی normal_records')
+@router.post('/runs', status_code=202, summary='نرمال‌سازی فقط رکوردهای جدید dataset_records')
 def start(request: Request, tasks: BackgroundTasks, database: DB):
     if not request.app.state.import_lock.acquire(blocking=False):
         raise HTTPException(409, 'An import or normalization is already running')
     job_id = str(uuid4())
     try:
         database.normalization_runs.insert_one({'_id': job_id, 'status': 'running', 'phase': 'fit',
-            'processed': 0, 'created_at': datetime.now(timezone.utc)})
+            'processed': 0, 'skipped': 0, 'created_at': datetime.now(timezone.utc)})
     except Exception:
         request.app.state.import_lock.release()
         raise

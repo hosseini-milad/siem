@@ -1,10 +1,11 @@
-"""Fit on all source rows, then transform to a staging collection and publish."""
+"""Incremental normalization using a persisted, immutable feature schema."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from ipaddress import ip_address
 import math
 
 from bson import BSON
+from pymongo import UpdateOne
 
 EXCLUDED = {'_id', 'source file', 'original_id'}
 MISSING = {'', 'nan', 'inf', '+inf', '-inf', 'infinity', '-infinity', 'null', 'none'}
@@ -114,38 +115,66 @@ def transform(row, schema):
             low = Decimal(stat['min']) if stat['min'] is not None else None
             high = Decimal(stat['max']) if stat['max'] is not None else None
             result[field] = float((value - low) / (high - low)) if value is not None and low is not None and high != low else 0.0
-            if not math.isfinite(result[field]) or not 0 <= result[field] <= 1:
-                raise ValueError('Source changed during normalization; retry with a stable dataset')
+            result[field] = max(0.0, min(1.0, result[field]))
+            if not math.isfinite(result[field]):
+                raise ValueError('Nonfinite normalized value')
     return result
 
 
 def normalize(db, job_id):
-    temporary = 'normal_staging_' + job_id.replace('-', '')
-    processed = 0
+    processed = skipped = 0
     try:
-        count, schema = fit(db)
-        db.normalization_runs.update_one({'_id': job_id}, {'$set': {'total': count, 'schema': schema, 'phase': 'transform'}})
-        collection = db[temporary]
-        collection.create_index('original_id', unique=True)
+        parameters = db.normalization_parameters.find_one({'_id': 'default'})
+        if parameters is None:
+            # Reuse the schema that produced output from the previous release.
+            previous = db.normalization_runs.find_one(
+                {'status': 'completed', 'schema': {'$exists': True}}, sort=[('finished_at', -1)])
+            if previous:
+                schema = previous['schema']
+            elif db.normal_records.estimated_document_count():
+                raise ValueError('Existing normal_records has no saved schema; restore the matching completed run before continuing')
+            else:
+                _, schema = fit(db)
+            db.normalization_parameters.update_one({'_id': 'default'}, {'$setOnInsert': {
+                'schema': schema, 'created_at': datetime.now(timezone.utc)}}, upsert=True)
+            parameters = db.normalization_parameters.find_one({'_id': 'default'})
+        schema = parameters['schema']
+        db.normal_records.create_index('original_id', unique=True)
+        db.normalization_runs.update_one({'_id': job_id}, {'$set': {
+            'total': db.dataset_records.count_documents({}), 'schema': schema, 'phase': 'transform'}})
+
+        def consume(rows):
+            nonlocal processed, skipped
+            ids = [row['_id'] for row in rows]
+            existing = {row['original_id'] for row in db.normal_records.find(
+                {'original_id': {'$in': ids}}, {'original_id': 1})}
+            operations = []
+            fields = {stat['field'] for stat in schema}
+            for row in rows:
+                if row['_id'] in existing:
+                    skipped += 1
+                    continue
+                extra = {key for key in row if key.strip().casefold() not in EXCLUDED and key != 'Label'} - fields
+                if extra:
+                    raise ValueError('New source columns do not match the saved normalization schema')
+                document = transform(row, schema)
+                operations.append(UpdateOne({'original_id': row['_id']}, {'$setOnInsert': document}, upsert=True))
+            if operations:
+                result = db.normal_records.bulk_write(operations)
+                processed += result.upserted_count
+            db.normalization_runs.update_one({'_id': job_id}, {'$set': {'processed': processed, 'skipped': skipped}})
+
         batch = []
         for row in db.dataset_records.find().batch_size(500):
-            batch.append(transform(row, schema))
+            batch.append(row)
             if len(batch) == 500:
-                collection.insert_many(batch)
-                processed += len(batch)
+                consume(batch)
                 batch = []
-                db.normalization_runs.update_one({'_id': job_id}, {'$set': {'processed': processed}})
         if batch:
-            collection.insert_many(batch)
-            processed += len(batch)
-        if processed != count:
-            raise ValueError('Source count changed during normalization')
-        collection.rename('normal_records', dropTarget=True)
+            consume(batch)
         db.normalization_runs.update_one({'_id': job_id}, {'$set': {'status': 'completed', 'phase': 'done',
-            'processed': processed, 'finished_at': datetime.now(timezone.utc)}})
+            'processed': processed, 'skipped': skipped, 'finished_at': datetime.now(timezone.utc)}})
     except Exception as exc:
         message = str(exc) if isinstance(exc, ValueError) else 'Normalization failed; check database availability and server logs'
         db.normalization_runs.update_one({'_id': job_id}, {'$set': {'status': 'failed', 'error': message[:500],
-            'processed': processed, 'finished_at': datetime.now(timezone.utc)}})
-    finally:
-        db.drop_collection(temporary)
+            'processed': processed, 'skipped': skipped, 'finished_at': datetime.now(timezone.utc)}})
