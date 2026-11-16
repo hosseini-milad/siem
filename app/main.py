@@ -1,4 +1,7 @@
 from contextlib import asynccontextmanager
+from threading import Lock
+
+from app.api.datasets import router as datasets_router
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -22,6 +25,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             def initialize():
                 client.admin.command("ping")
+                app.state.database.dataset_records.create_index("folder")
+                app.state.database.dataset_imports.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index([("timestamp", -1), ("_id", -1)])
                 collection.create_index([("source", 1), ("timestamp", -1)])
@@ -35,7 +40,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   description="فاز اول: دریافت و ذخیره لاگ در MongoDB. بدون احراز هویت و هوش مصنوعی.",
                   swagger_ui_parameters={"displayRequestDuration": True},
                   responses={503: {"description": "MongoDB unavailable; batch writes may be partial"}})
+    app.state.settings = config
+    app.state.import_lock = Lock()
     app.include_router(router)
+    app.include_router(datasets_router)
 
     @app.exception_handler(PyMongoError)
     async def database_error(request: Request, exc: PyMongoError):
