@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pymongo import UpdateOne
+from pymongo import ReplaceOne
 
 
 def folder_path(root: Path, name: str) -> Path:
@@ -87,15 +87,15 @@ def import_folder(db, root: Path, folder: str, job_id: str):
                     header = next(reader, None)
                     if not header or any(not key.strip() for key in header) or len(set(header)) != len(header):
                         raise ValueError("CSV requires unique, nonempty column names")
+                    if "_id" in header:
+                        raise ValueError("CSV column _id is reserved for MongoDB record identity")
                     batch = []
                     for number, values in enumerate(reader, 1):
                         if len(values) != len(header):
                             raise ValueError(f"CSV row {number} has an unexpected column count")
-                        document = {'folder': folder, 'archive': parts[0].name, 'row_number': number,
-                                    'data': dict(zip(header, values)), 'import_id': job_id,
-                                    'received_at': datetime.now(timezone.utc)}
+                        document = dict(zip(header, values))
                         key = f'{identity}:{number}'
-                        batch.append(UpdateOne({'_id': key}, {'$setOnInsert': document}, upsert=True))
+                        batch.append(ReplaceOne({'_id': key}, {'_id': key, **document}, upsert=True))
                         if len(batch) == 500:
                             result = db.dataset_records.bulk_write(batch)
                             processed += len(batch)

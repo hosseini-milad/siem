@@ -61,9 +61,9 @@ def import_status(import_id: UUID, database: DB):
 
 
 @router.get('/records', summary='مشاهده ردیف‌های ذخیره‌شدهٔ دیتاست')
-def records(database: DB, folder: str = Query(min_length=1), limit: int = Query(50, ge=1, le=100),
+def records(database: DB, limit: int = Query(50, ge=1, le=100),
             offset: int = Query(0, ge=0, le=100000)):
-    query = {'folder': folder}
+    query = {}
     rows = database.dataset_records.find(query).sort('_id', 1).skip(offset).limit(limit)
-    return {'items': [{'id': row.pop('_id'), **row} for row in rows],
+    return {'items': list(rows),
             'total': database.dataset_records.count_documents(query), 'limit': limit, 'offset': offset}

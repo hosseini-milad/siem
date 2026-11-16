@@ -36,10 +36,13 @@ def test_split_gzip_import_and_repeat(setup):
         assert status['status'] == 'completed', status
         assert status['inserted'] == expected
         assert status['processed'] == 2
-    rows = client.get('/api/v1/datasets/records?folder=Benign').json()
+    rows = client.get('/api/v1/datasets/records').json()
     assert rows['total'] == 2
-    assert any(row['data']['message'] == 'سلام' for row in rows['items'])
+    assert any(row['message'] == 'سلام' for row in rows['items'])
     assert db.dataset_records.count_documents({}) == 2
+    for row in db.dataset_records.find():
+        assert set(row) == {'_id', 'time', 'message'}
+    assert all(set(row) == {'_id', 'time', 'message'} for row in rows['items'])
 
 
 def test_invalid_paths_parts_and_csv(setup):
@@ -76,3 +79,17 @@ def test_missing_root_and_busy(setup):
         client.app.state.import_lock.release()
     client.app.state.settings.datasets_root = str(folder / 'absent')
     assert client.get('/api/v1/datasets/folders').status_code == 503
+
+
+def test_original_column_names_and_reserved_id(setup):
+    client, folder, db = setup
+    (folder / 'data.csv').write_text('folder,data,id,received_at\noriginal,raw,source-id,source-time\n')
+    job = client.post('/api/v1/datasets/imports', json={'folder': 'Benign'}).json()['id']
+    assert client.get('/api/v1/datasets/imports/' + job).json()['status'] == 'completed'
+    row = db.dataset_records.find_one()
+    assert {k: v for k, v in row.items() if k != '_id'} == {
+        'folder': 'original', 'data': 'raw', 'id': 'source-id', 'received_at': 'source-time'}
+    (folder / 'data.csv').write_text('_id,value\nsource-id,x\n')
+    job = client.post('/api/v1/datasets/imports', json={'folder': 'Benign'}).json()['id']
+    assert client.get('/api/v1/datasets/imports/' + job).json()['status'] == 'failed'
+    assert db.dataset_records.count_documents({}) == 1

@@ -25,7 +25,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             def initialize():
                 client.admin.command("ping")
-                app.state.database.dataset_records.create_index("folder")
                 app.state.database.dataset_imports.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index([("timestamp", -1), ("_id", -1)])
