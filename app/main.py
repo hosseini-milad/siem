@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from threading import Lock
 
 from app.api.datasets import router as datasets_router
+from app.api.normalization import router as normalization_router
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -25,6 +26,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             def initialize():
                 client.admin.command("ping")
+                app.state.database.normalization_runs.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
                 app.state.database.dataset_imports.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index([("timestamp", -1), ("_id", -1)])
@@ -43,6 +45,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.import_lock = Lock()
     app.include_router(router)
     app.include_router(datasets_router)
+    app.include_router(normalization_router)
 
     @app.exception_handler(PyMongoError)
     async def database_error(request: Request, exc: PyMongoError):
