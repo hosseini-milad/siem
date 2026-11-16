@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
 from threading import Lock
+from datetime import datetime, timezone
+import logging
 
 from app.api.datasets import router as datasets_router
 from app.api.normalization import router as normalization_router
@@ -26,7 +28,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             def initialize():
                 client.admin.command("ping")
-                app.state.database.normalization_runs.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
+                interrupted = app.state.database.normalization_runs.update_many(
+                    {"status": "running"}, {"$set": {"status": "interrupted",
+                     "interruption_reason": "Server started again before this run finished (restart, reload, or another worker)",
+                     "interrupted_at": datetime.now(timezone.utc)}})
+                if interrupted.modified_count:
+                    logging.getLogger('uvicorn.error.siem.normalization').warning(
+                        'Startup marked %s previous normalization runs interrupted; use one worker and no reload',
+                        interrupted.modified_count)
                 app.state.database.dataset_imports.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index([("timestamp", -1), ("_id", -1)])

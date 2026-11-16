@@ -111,3 +111,47 @@ def test_reuses_previous_release_schema(setup):
     assert status['status'] == 'completed'
     assert status['schema'] == first['schema']
     assert status['processed'] == 1 and status['skipped'] == 1
+
+
+def test_fit_progress_failure_and_console_logs(setup, monkeypatch, caplog):
+    from app.services import normalization
+    client, db = setup
+    caplog.set_level('INFO', logger='uvicorn.error.siem.normalization')
+    db.dataset_records.insert_one({'_id': 'a', 'Label': 'benign', 'value': '10'})
+    original_fit = normalization.fit
+
+    def checked_fit(database, progress):
+        def observe(count):
+            progress(count)
+            state = database.normalization_runs.find_one({'status': 'running'})
+            assert state['phase'] == 'fit'
+            assert state['scanned'] == count
+            assert state['heartbeat_at'] is not None
+        return original_fit(database, observe)
+
+    monkeypatch.setattr(normalization, 'fit', checked_fit)
+    result = run(client)
+    assert result['status'] == 'completed'
+    assert result['worker_pid'] > 0
+    assert 'fit scanned=1' in caplog.text
+    assert result['_id'] in caplog.text
+    assert 'completed inserted=1' in caplog.text
+    db.dataset_records.insert_one({'_id': 'b', 'Label': ''})
+    result = run(client)
+    assert result['status'] == 'failed' and result['error_type'] == 'ValueError'
+    assert 'Missing or unknown Label' in result['error']
+    assert 'failed inserted=' in caplog.text
+
+
+def test_startup_records_interruption_reason(setup, caplog):
+    client, db = setup
+    caplog.set_level('INFO', logger='uvicorn.error.siem.normalization')
+    job_id = str(uuid4())
+    db.normalization_runs.insert_one({'_id': job_id, 'status': 'running', 'phase': 'fit'})
+    config = Settings(mongodb_database=db.name)
+    with TestClient(create_app(config)):
+        result = db.normalization_runs.find_one({'_id': job_id})
+        assert result['status'] == 'interrupted'
+        assert 'Server started again' in result['interruption_reason']
+        assert result['interrupted_at'] is not None
+    assert 'previous normalization runs interrupted' in caplog.text

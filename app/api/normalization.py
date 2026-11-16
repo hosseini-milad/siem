@@ -1,10 +1,14 @@
 from datetime import datetime, timezone
+import logging
+import os
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
 from app.api.logs import DB
 from app.services.normalization import normalize
+
+logger = logging.getLogger('uvicorn.error.siem.normalization')
 
 router = APIRouter(prefix='/api/v1/normalization', tags=['Normalization'])
 
@@ -16,7 +20,7 @@ def start(request: Request, tasks: BackgroundTasks, database: DB):
     job_id = str(uuid4())
     try:
         database.normalization_runs.insert_one({'_id': job_id, 'status': 'running', 'phase': 'fit',
-            'processed': 0, 'skipped': 0, 'created_at': datetime.now(timezone.utc)})
+            'processed': 0, 'skipped': 0, 'scanned': 0, 'worker_pid': os.getpid(), 'created_at': datetime.now(timezone.utc)})
     except Exception:
         request.app.state.import_lock.release()
         raise
@@ -26,6 +30,7 @@ def start(request: Request, tasks: BackgroundTasks, database: DB):
             normalize(database, job_id)
         finally:
             request.app.state.import_lock.release()
+    logger.info('Normalization %s accepted pid=%s; use this id to poll status', job_id, os.getpid())
     tasks.add_task(run)
     return {'id': job_id, 'status': 'running'}
 
