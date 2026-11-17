@@ -233,6 +233,8 @@ SIEM_MONGODB_SERVER_SELECTION_TIMEOUT_MS=3000
 .venv/bin/python -m pip install -r requirements.lock
 ```
 
+برای Windows x64 با Python 3.14، نسخهٔ CatBoost در lockfile برابر `1.2.10` است؛ نسخهٔ قبلی `1.2.8` wheel مناسب این Python نداشت و pip به ساخت از سورس می‌رفت. برای اطمینان از نصب بستهٔ آماده، `python -m pip install --only-binary=catboost -r requirements.lock` اجرا کنید.
+
 روی Linux کتابخانهٔ OpenMP (`libgomp1`) لازم است. تنظیمات `SIEM_ML_THREADS=2` و `SIEM_ML_MODEL_DIR=data/ml` باقی‌اند. تنها یک worker بدون reload اجرا کنید؛ برای سرور چند‌هسته‌ای تعداد نخ‌ها را متناسب با CPU تنظیم کنید. آموزش دو مدل به‌ترتیب انجام می‌شود تا مصرف CPU دو برابر نشود.
 
 ### بدون آرشیو یا نسخه‌بندی مدل
