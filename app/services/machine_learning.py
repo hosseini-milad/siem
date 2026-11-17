@@ -10,14 +10,15 @@ import random
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
-from uuid import uuid4
+from tempfile import TemporaryDirectory
 
+from catboost import CatBoostClassifier
 import lightgbm as lgb
 import numpy as np
 from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (average_precision_score, brier_score_loss, confusion_matrix,
-                             precision_score, recall_score, roc_auc_score)
+                             precision_score, recall_score, roc_auc_score, f1_score, log_loss)
 
 from app.services.normalization import EXCLUDED, fit_rows, label_value, transform, value_text, MISSING
 from app.services.standardization import BLOCK_SIZE, BOUNDED_FEATURES, block_features, scale_features
@@ -131,16 +132,27 @@ class Predictor:
     def __init__(self, artifact, threads):
         self.artifact = artifact
         self.names = artifact['features']
-        self.version = artifact['model_version']
         self.threads = threads
         self.booster = lgb.Booster(model_str=artifact['booster'])
+        self.catboost = CatBoostClassifier(thread_count=threads)
+        with TemporaryDirectory(prefix='siem-cat-load-') as temporary:
+            path = Path(temporary) / 'model.json'
+            path.write_text(json.dumps(artifact['catboost']), encoding='utf-8')
+            self.catboost.load_model(str(path), format='json')
         self.lock = Lock()  # Avoid concurrent native calls and unbounded CPU oversubscription.
 
-    def probabilities(self, matrix):
+    def raw_scores(self, matrix):
         with self.lock:
-            margins = self.booster.predict(matrix, raw_score=True, num_threads=self.threads)
-        return expit(self.artifact['calibration']['coefficient'] * margins +
-                     self.artifact['calibration']['intercept'])
+            light = self.booster.predict(matrix, raw_score=True, num_threads=self.threads)
+            cat = np.asarray(self.catboost.predict(matrix, prediction_type='RawFormulaVal',
+                                                  thread_count=self.threads)).reshape(-1)
+        weight = self.artifact['ensemble']['lightgbm_weight']
+        combined = np.clip(weight * expit(light) + (1 - weight) * expit(cat), 1e-12, 1 - 1e-12)
+        return {'lightgbm': light, 'catboost': cat, 'ensemble': np.log(combined / (1 - combined))}
+
+    def probabilities(self, matrix):
+        margins = self.raw_scores(matrix)['ensemble']
+        return apply_calibration(margins, self.artifact['calibration'])
 
     def predict(self, records=None, matrix=None, raw=False):
         start = perf_counter()
@@ -167,7 +179,7 @@ class Predictor:
                   'attack_probability': float(probability),
                   'predicted_label': int(probability >= threshold)}
                  for i, probability in enumerate(probabilities)]
-        return {'model_version': self.version, 'count': len(items), 'items': items,
+        return {'count': len(items), 'items': items,
                 'timing_ms': {'prepare': (prepared - start) * 1000,
                               'inference': (predicted - prepared) * 1000,
                               'service_total': (perf_counter() - start) * 1000}}
@@ -179,11 +191,14 @@ class ModelManager:
         self.threads = threads
         self.active = None
         self.training_lock = Lock()
+        self.state_lock = Lock()
         path = self.directory / 'active.json'
         if path.exists():
-            self.active = Predictor(json.loads(path.read_text()), threads)
+            artifact = json.loads(path.read_text())
+            if 'catboost' in artifact:  # Old LightGBM-only files are not served or migrated.
+                self.active = Predictor(artifact, threads)
 
-    def require(self, version=None):
+    def require(self):
         predictor = self.active  # Each request retains its snapshot during a model swap.
         if predictor is None:
             raise LookupError('No trained model is active')
@@ -194,30 +209,35 @@ class ModelManager:
             rejected = rejected or (matrix[0][0] + matrix[1][0] == 0 or matrix[0][1] + matrix[1][1] == 0)
         if rejected or metrics.get('roc_auc', 1) <= 0.5:
             raise LookupError('Active model failed discrimination checks; retrain before predicting')
-        if version is not None and version != predictor.version:
-            raise ValueError('model_version does not match the active model; refresh the schema')
         return predictor
+
+    def clear(self):
+        with self.state_lock:
+            self.active = None
+            (self.directory / 'active.json').unlink(missing_ok=True)
+            (self.directory / 'active.tmp').unlink(missing_ok=True)
 
     def publish(self, artifact):
         predictor = Predictor(artifact, self.threads)
         self.directory.mkdir(parents=True, exist_ok=True)
-        temporary = self.directory / (artifact['model_version'] + '.tmp')
+        temporary = self.directory / 'active.tmp'
         try:
             temporary.write_text(json.dumps(artifact, allow_nan=False))
             os.replace(temporary, self.directory / 'active.json')
         finally:
             temporary.unlink(missing_ok=True)
-        self.active = predictor
+        with self.state_lock:
+            self.active = predictor
 
 
 def coverage_requirements(counts, budget):
-    """Minimum stratum quotas needed to cover both labels in three disjoint splits."""
-    mixed = min(3, counts['mixed'])
-    requirements = {'mixed': mixed, 'benign': 3 - mixed, 'attack': 3 - mixed}
+    """Minimum stratum quotas needed to cover both labels in four disjoint splits."""
+    mixed = min(4, counts['mixed'])
+    requirements = {'mixed': mixed, 'benign': 4 - mixed, 'attack': 4 - mixed}
     description = ', '.join(f'{name}={counts[name]}' for name in ('benign', 'attack', 'mixed'))
     if any(counts[name] < value for name, value in requirements.items()):
-        raise ValueError('Insufficient independent blocks for both classes in train, calibration and test: '
-                         + description + '. Each class must occur in at least 3 distinct complete blocks; '
+        raise ValueError('Insufficient independent blocks for both classes in train, validation, calibration and test: '
+                         + description + '. Each class must occur in at least 4 distinct complete blocks; '
                          'add labelled blocks or complete normalization/standardization. Do not duplicate records.')
     minimum = sum(requirements.values())
     if budget < minimum:
@@ -302,26 +322,29 @@ def split_blocks(blocks):
     rng = random.Random(42)
     for indices in groups.values():
         rng.shuffle(indices)
-    indices = [[], [], []]
+    indices = [[], [], [], []]
     # Seed small holdouts with mixed blocks first; pure blocks require a pair per split.
-    for partition in (2, 1, 0):
+    for partition in (3, 2, 1, 0):
         if groups['mixed']:
             indices[partition].append(groups['mixed'].pop())
         else:
             indices[partition].extend([groups['benign'].pop(), groups['attack'].pop()])
-    targets = [int(len(blocks) * 0.6), int(len(blocks) * 0.2)]
-    targets.append(len(blocks) - sum(targets))
+    desired = [len(blocks) * ratio for ratio in (0.55, 0.15, 0.15, 0.15)]
+    targets = [max(1, int(value)) for value in desired]
+    while sum(targets) < len(blocks):
+        part = max(range(4), key=lambda index: desired[index] - targets[index])
+        targets[part] += 1
     remaining = [index for group in groups.values() for index in group]
     rng.shuffle(remaining)
     for index in remaining:
-        partition = max(range(3), key=lambda part: targets[part] - len(indices[part]))
+        partition = max(range(4), key=lambda part: targets[part] - len(indices[part]))
         indices[partition].append(index)
     for group in indices:
         group.sort()
     return [[blocks[index] for index in group] for group in indices], indices
 
 
-def train(blocks, threads, threshold=0.5, rounds=150, input_format='raw', preprocessing=None):
+def train(blocks, threads, threshold=0.5, rounds=500, input_format='raw', preprocessing=None):
     partitions, partition_indices = split_blocks(blocks)
     labels = [np.asarray([label_value(row) for block in part for row in block], dtype=np.int32)
               for part in partitions]
@@ -362,58 +385,108 @@ def train(blocks, threads, threshold=0.5, rounds=150, input_format='raw', prepro
         for part in partitions[1:]:
             matrices.append(np.concatenate([feature_matrix(prepare_raw(block, schema, bounds)[0], names)
                                             for block in part]))
-    booster = lgb.train({'objective': 'binary', 'verbosity': -1, 'num_threads': threads,
+    constant = np.ptp(matrices[0], axis=0) == 0
+    if constant.all():
+        raise TrainingRejected('All training features are constant; inspect standard_records before retraining',
+                               {'feature_count': len(names), 'train_constant_features': names})
+    feature_ids = [f'f{i}' for i in range(len(names))]
+    training_data = lgb.Dataset(matrices[0], label=labels[0], feature_name=feature_ids)
+    validation_data = lgb.Dataset(matrices[1], label=labels[1], feature_name=feature_ids, reference=training_data)
+    booster = lgb.train({'objective': 'binary', 'metric': 'auc', 'verbosity': -1, 'num_threads': threads,
                          'num_leaves': 31, 'max_depth': 6, 'learning_rate': 0.05,
-                         'min_data_in_leaf': 40, 'seed': 42, 'deterministic': True,
-                         'force_col_wise': True},
-                        lgb.Dataset(matrices[0], label=labels[0],
-                                    feature_name=[f'f{i}' for i in range(len(names))]),
-                        num_boost_round=rounds)
-    margins = booster.predict(matrices[1], raw_score=True, num_threads=threads)
-    calibration = LogisticRegression(random_state=42).fit(margins.reshape(-1, 1), labels[1])
-    artifact = {'model_version': uuid4().hex, 'format_version': 1, 'algorithm': 'LightGBM',
+                         'min_data_in_leaf': 40, 'seed': 42, 'deterministic': True, 'force_col_wise': True},
+                        training_data, num_boost_round=rounds, valid_sets=[validation_data],
+                        callbacks=[lgb.early_stopping(50, verbose=False)])
+    cat = CatBoostClassifier(iterations=rounds, depth=6, learning_rate=0.05, loss_function='Logloss',
+                             eval_metric='AUC', thread_count=threads, random_seed=42,
+                             allow_writing_files=False, verbose=False)
+    cat.fit(matrices[0], labels[0], eval_set=(matrices[1], labels[1]),
+            early_stopping_rounds=50, use_best_model=True)
+    light_valid = expit(booster.predict(matrices[1], raw_score=True, num_threads=threads))
+    cat_valid = cat.predict_proba(matrices[1], thread_count=threads)[:, 1]
+    weight, selection_scores = choose_weight(light_valid, cat_valid, labels[1])
+    with TemporaryDirectory(prefix='siem-cat-save-') as temporary:
+        path = Path(temporary) / 'model.json'
+        cat.save_model(str(path), format='json')
+        cat_payload = json.loads(path.read_text(encoding='utf-8'))
+    split_names = ('train', 'validation', 'calibration', 'test')
+    artifact = {'algorithm': 'LightGBM + CatBoost',
                 'created_at': datetime.now(timezone.utc).isoformat(), 'features': names,
                 'input_format': input_format,
                 'preprocessing_provenance': ('existing standard_records; preprocessing may have been fitted globally'
                                              if input_format == 'standard' else 'raw; train-only fit'),
                 'normalization_schema': schema, 'behavior_bounds': bounds,
-                'threshold': threshold, 'booster': booster.model_to_string(),
-                'calibration': {'method': 'Platt', 'coefficient': float(calibration.coef_[0, 0]),
-                                'intercept': float(calibration.intercept_[0])},
+                'threshold': threshold, 'booster': booster.model_to_string(), 'catboost': cat_payload,
+                'ensemble': {'method': 'weighted raw probabilities followed by Platt calibration',
+                             'lightgbm_weight': weight, 'catboost_weight': 1 - weight,
+                             'selection_metric': 'validation_log_loss', 'validation_scores': selection_scores},
                 'feature_importance_gain': dict(zip(names, booster.feature_importance('gain').tolist())),
+                'feature_importance_catboost': dict(zip(names, cat.get_feature_importance().tolist())),
                 'split': {'order': 'deterministic class-covered whole-block split; not chronological',
-                          'seed': 42, 'block_indices': dict(zip(('train', 'calibration', 'test'), partition_indices)),
+                          'seed': 42, 'block_indices': dict(zip(split_names, partition_indices)),
                           'class_counts': {name: {'benign': int((y == 0).sum()), 'attack': int((y == 1).sum())}
-                                           for name, y in zip(('train', 'calibration', 'test'), labels)},
-                          'train_rows': len(labels[0]), 'calibration_rows': len(labels[1]),
-                          'test_rows': len(labels[2])}}
+                                           for name, y in zip(split_names, labels)},
+                          **{name + '_rows': len(y) for name, y in zip(split_names, labels)}}}
     predictor = Predictor(artifact, threads)
-    probabilities = predictor.probabilities(matrices[2])
-    predictions = probabilities >= threshold
-    artifact['test_metrics'] = {
-        'precision': float(precision_score(labels[2], predictions, zero_division=0)),
-        'recall': float(recall_score(labels[2], predictions, zero_division=0)),
-        'roc_auc': float(roc_auc_score(labels[2], probabilities)),
-        'average_precision': float(average_precision_score(labels[2], probabilities)),
-        'brier_score': float(brier_score_loss(labels[2], probabilities)),
-        'confusion_matrix': confusion_matrix(labels[2], predictions, labels=[0, 1]).tolist()}
+    calibration_scores = predictor.raw_scores(matrices[2])
+    calibrations = {name: fit_calibration(score, labels[2]) for name, score in calibration_scores.items()}
+    artifact['calibration'] = calibrations['ensemble']
+    artifact['base_calibration'] = {name: calibrations[name] for name in ('lightgbm', 'catboost')}
+    test_scores = predictor.raw_scores(matrices[3])
+    artifact['evaluation'] = {name: {**metric_report(labels[3], apply_calibration(score, calibrations[name]), threshold),
+                                    'raw_auc': float(roc_auc_score(labels[3], score))}
+                              for name, score in test_scores.items()}
+    artifact['test_metrics'] = artifact['evaluation']['ensemble']
     artifact['diagnostics'] = {
-        'feature_count': len(names),
-        'train_constant_features': [name for name, constant in zip(names, np.ptp(matrices[0], axis=0) == 0) if constant],
-        'calibration': score_diagnostics(booster, matrices[1], labels[1], artifact, threads),
-        'test': score_diagnostics(booster, matrices[2], labels[2], artifact, threads),
-        'trained_trees': booster.num_trees()}
+        'feature_count': len(names), 'train_constant_features': [name for name, flag in zip(names, constant) if flag],
+        'calibration': score_diagnostics(calibration_scores['ensemble'], labels[2], artifact),
+        'test': score_diagnostics(test_scores['ensemble'], labels[3], artifact),
+        'trained_trees': {'lightgbm': predictor.booster.num_trees(), 'catboost': cat.tree_count_}}
     artifact['acceptance'] = acceptance(artifact)
     return artifact
 
 
-def score_diagnostics(booster, matrix, labels, artifact, threads):
-    margins = booster.predict(matrix, raw_score=True, num_threads=threads)
-    probabilities = expit(artifact['calibration']['coefficient'] * margins + artifact['calibration']['intercept'])
-    return {'raw_auc': float(roc_auc_score(labels, margins)),
-            'raw_margin_std': float(np.std(margins)),
-            'raw_probability_min': float(expit(margins).min()),
-            'raw_probability_max': float(expit(margins).max()),
+class TrainingRejected(ValueError):
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def choose_weight(light, cat, labels):
+    scores = [{'lightgbm_weight': float(weight), 'log_loss': float(log_loss(labels, weight * light + (1 - weight) * cat))}
+              for weight in np.linspace(0, 1, 11)]
+    best = min(scores, key=lambda row: (row['log_loss'], abs(row['lightgbm_weight'] - 0.5)))
+    return best['lightgbm_weight'], scores
+
+
+def fit_calibration(margins, labels):
+    calibration = LogisticRegression(random_state=42).fit(margins.reshape(-1, 1), labels)
+    return {'method': 'Platt', 'coefficient': float(calibration.coef_[0, 0]),
+            'intercept': float(calibration.intercept_[0])}
+
+
+def apply_calibration(margins, calibration):
+    return expit(calibration['coefficient'] * margins + calibration['intercept'])
+
+
+def metric_report(labels, probabilities, threshold):
+    predictions = probabilities >= threshold
+    matrix = confusion_matrix(labels, predictions, labels=[0, 1])
+    tn, fp, fn, tp = matrix.ravel()
+    return {'precision': float(precision_score(labels, predictions, zero_division=0)),
+            'recall': float(recall_score(labels, predictions, zero_division=0)),
+            'f1': float(f1_score(labels, predictions, zero_division=0)),
+            'accuracy': float((tn + tp) / len(labels)), 'false_positive_rate': float(fp / (tn + fp)),
+            'roc_auc': float(roc_auc_score(labels, probabilities)),
+            'average_precision': float(average_precision_score(labels, probabilities)),
+            'brier_score': float(brier_score_loss(labels, probabilities)),
+            'log_loss': float(log_loss(labels, probabilities)), 'confusion_matrix': matrix.tolist()}
+
+
+def score_diagnostics(margins, labels, artifact):
+    probabilities = apply_calibration(margins, artifact['calibration'])
+    return {'raw_auc': float(roc_auc_score(labels, margins)), 'raw_margin_std': float(np.std(margins)),
+            'raw_probability_min': float(expit(margins).min()), 'raw_probability_max': float(expit(margins).max()),
             'calibrated_auc': float(roc_auc_score(labels, probabilities)),
             'probability_min': float(probabilities.min()), 'probability_max': float(probabilities.max()),
             'predicted_attack': int((probabilities >= artifact['threshold']).sum()),
@@ -456,15 +529,20 @@ def training_job(db, manager, job_id, max_records, threshold, rounds):
             db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
                 'status': 'rejected', 'phase': 'quality_gate', 'metrics': artifact['test_metrics'],
                 'split': artifact['split'], 'diagnostics': artifact['diagnostics'],
-                'acceptance': artifact['acceptance'], 'calibration': artifact['calibration'],
-                'finished_at': datetime.now(timezone.utc)}})
+                'acceptance': artifact['acceptance'], 'calibration': artifact['calibration'], 'evaluation': artifact['evaluation'],
+                'ensemble': artifact['ensemble'], 'finished_at': datetime.now(timezone.utc)}})
             return
         manager.publish(artifact)
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
-            'status': 'completed', 'phase': 'done', 'model_version': artifact['model_version'],
-            'metrics': artifact['test_metrics'], 'split': artifact['split'],
+            'status': 'completed', 'phase': 'done', 'metrics': artifact['test_metrics'], 'split': artifact['split'],
             'diagnostics': artifact['diagnostics'], 'acceptance': artifact['acceptance'],
             'calibration': artifact['calibration'], 'input_format': 'standard',
+            'evaluation': artifact['evaluation'], 'ensemble': artifact['ensemble'],
+            'finished_at': datetime.now(timezone.utc)}})
+    except TrainingRejected as exc:
+        db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
+            'status': 'rejected', 'phase': 'quality_gate', 'sampling': sampling,
+            'diagnostics': exc.diagnostics, 'acceptance': {'accepted': False, 'reasons': [str(exc)]},
             'finished_at': datetime.now(timezone.utc)}})
     except Exception as exc:
         logger.exception('ML training %s failed', job_id)

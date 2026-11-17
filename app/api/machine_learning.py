@@ -1,11 +1,10 @@
 from datetime import datetime, timezone
 from time import perf_counter
-from uuid import UUID, uuid4
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response, Query
 import orjson
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from pymongo import UpdateOne, timeout
 from pymongo.errors import PyMongoError
 
@@ -18,38 +17,38 @@ router = APIRouter(prefix='/api/v1/ml', tags=['Machine Learning'])
 
 
 class TrainingRequest(BaseModel):
-    max_records: int = Field(default=100000, ge=50000, le=1000000, multiple_of=10000)
+    max_records: int = Field(default=300000, ge=50000, le=1000000, multiple_of=10000)
     threshold: float = Field(default=0.5, gt=0, lt=1)
-    rounds: int = Field(default=150, ge=10, le=500)
+    rounds: int = Field(default=500, ge=10, le=2000)
 
 
 class PredictRequest(BaseModel):
-    model_version: str
+    model_config = ConfigDict(extra='forbid')
     records: list[dict] = Field(min_length=1, max_length=10000)
     input_format: Literal['standard', 'raw'] = 'standard'
     persist: bool = False
 
 
 class MatrixRequest(BaseModel):
-    model_version: str
+    model_config = ConfigDict(extra='forbid')
     matrix: list[list[float]] = Field(min_length=1, max_length=10000)
 
 
-def active(request, version=None):
+def active(request):
     try:
-        return request.app.state.ml.require(version)
+        return request.app.state.ml.require()
     except LookupError as exc:
         raise HTTPException(503, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
 
-@router.get('/model', summary='نسخه، ترتیب ویژگی‌ها، پارامترهای پیش‌پردازش و ارزیابی مدل فعال')
+@router.get('/model', summary='مدل جاری، ترتیب ویژگی‌ها و مقایسهٔ LightGBM و CatBoost')
 def model(request: Request):
     predictor = request.app.state.ml.active
     if predictor is None:
         raise HTTPException(503, 'No trained model is active')
-    metadata = {key: value for key, value in predictor.artifact.items() if key != 'booster'}
+    metadata = {key: value for key, value in predictor.artifact.items() if key not in {'booster', 'catboost'}}
     try:
         request.app.state.ml.require()
         metadata['serving_eligible'] = True
@@ -67,8 +66,11 @@ def start_training(body: TrainingRequest, request: Request, tasks: BackgroundTas
     if not request.app.state.import_lock.acquire(blocking=False):
         manager.training_lock.release()
         raise HTTPException(409, 'Dataset import, normalization or standardization is running')
-    job_id = str(uuid4())
+    job_id = 'current'
     try:
+        manager.clear()
+        database.ml_training_runs.delete_many({})
+        database.ml_predictions.delete_many({})
         database.ml_training_runs.insert_one({'_id': job_id, 'status': 'running', 'phase': 'queued',
                                               'created_at': datetime.now(timezone.utc)})
     except Exception:
@@ -87,8 +89,10 @@ def start_training(body: TrainingRequest, request: Request, tasks: BackgroundTas
 
 
 @router.get('/training/runs/{run_id}')
-def training_status(run_id: UUID, database: DB):
-    row = database.ml_training_runs.find_one({'_id': str(run_id)})
+def training_status(run_id: str, database: DB):
+    if run_id != 'current':
+        raise HTTPException(404, 'Only the current training report is retained')
+    row = database.ml_training_runs.find_one({'_id': 'current'})
     if row is None:
         raise HTTPException(404, 'Training run not found')
     return row
@@ -97,7 +101,7 @@ def training_status(run_id: UUID, database: DB):
 @router.post('/predict', summary='پیش‌بینی اینلاین رکورد استاندارد یا خام بدون Label؛ حداکثر ۱۰۰۰۰ رکورد')
 def predict(body: PredictRequest, request: Request):
     started = perf_counter()
-    predictor = active(request, body.model_version)
+    predictor = active(request)
     if body.persist:
         ids = [row.get('original_id', row.get('_id')) for row in body.records]
         if any(not isinstance(value, str) or not value for value in ids) or len(set(ids)) != len(ids):
@@ -107,12 +111,15 @@ def predict(body: PredictRequest, request: Request):
     except (ValueError, TypeError, OverflowError) as exc:
         raise HTTPException(422, str(exc)) from exc
     write_start = perf_counter()
-    if body.persist:
-        now = datetime.now(timezone.utc)
-        request.app.state.database.ml_predictions.bulk_write([
-            UpdateOne({'_id': item['original_id']}, {'$set': {
-                **item, 'model_version': predictor.version, 'predicted_at': now}}, upsert=True)
-            for item in response['items']])
+    with request.app.state.ml.state_lock:
+        if request.app.state.ml.active is not predictor:
+            raise HTTPException(503, 'Model was reset during prediction; retry after training completes')
+        if body.persist:
+            now = datetime.now(timezone.utc)
+            request.app.state.database.ml_predictions.bulk_write([
+                UpdateOne({'_id': item['original_id']}, {'$set': {
+                    **item, 'predicted_at': now}}, upsert=True)
+                for item in response['items']])
     response['timing_ms']['database_write'] = (perf_counter() - write_start) * 1000 if body.persist else 0.0
     response['timing_ms']['handler_total'] = (perf_counter() - started) * 1000
     return Response(orjson.dumps(response), media_type='application/json')
@@ -120,9 +127,13 @@ def predict(body: PredictRequest, request: Request):
 
 @router.post('/predict-matrix', summary='مسیر سریع ماتریس float32 با ترتیب ویژگی‌های مدل؛ بدون دیتابیس')
 def predict_matrix(body: MatrixRequest, request: Request):
-    predictor = active(request, body.model_version)
+    predictor = active(request)
     try:
-        return Response(orjson.dumps(predictor.predict(matrix=body.matrix)), media_type='application/json')
+        result = predictor.predict(matrix=body.matrix)
+        with request.app.state.ml.state_lock:
+            if request.app.state.ml.active is not predictor:
+                raise HTTPException(503, 'Model was reset during prediction; retry after training completes')
+            return Response(orjson.dumps(result), media_type='application/json')
     except (ValueError, TypeError, OverflowError) as exc:
         raise HTTPException(422, str(exc)) from exc
 

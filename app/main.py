@@ -60,7 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             client.close()
 
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
-                  description="SIEM: دریافت لاگ، ویژگی‌های رفتاری و تشخیص دوکلاسه با LightGBM.",
+                  description="SIEM: دریافت لاگ، ویژگی‌های رفتاری و تشخیص دوکلاسه با LightGBM و CatBoost.",
                   swagger_ui_parameters={"displayRequestDuration": True},
                   responses={503: {"description": "MongoDB unavailable; batch writes may be partial"}})
     app.state.settings = config

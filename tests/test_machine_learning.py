@@ -43,7 +43,8 @@ def setup(tmp_path):
 
 def test_train_only_scaling_calibration_and_quality(trained):
     artifact, blocks = trained
-    assert artifact['split']['train_rows'] == 30000
+    assert artifact['split']['train_rows'] == 20000
+    assert artifact['split']['validation_rows'] == 10000
     assert artifact['split']['calibration_rows'] == artifact['split']['test_rows'] == 10000
     timestamp = next(stat for stat in artifact['normalization_schema'] if stat['field'] == 'Timestamp')
     train_indices = artifact['split']['block_indices']['train']
@@ -70,7 +71,7 @@ def test_artifact_reload_matrix_equivalence_and_concurrent_snapshots(trained, tm
     artifact, blocks = trained
     manager = ModelManager(tmp_path, 2)
     manager.publish(artifact)
-    reloaded = ModelManager(tmp_path, 2).require(artifact['model_version'])
+    reloaded = ModelManager(tmp_path, 2).require()
     records, _ = prepare_raw(blocks[4], artifact['normalization_schema'], artifact['behavior_bounds'])
     matrix = feature_matrix(records, artifact['features'])
     expected = reloaded.predict(matrix=matrix)['items']
@@ -79,8 +80,11 @@ def test_artifact_reload_matrix_equivalence_and_concurrent_snapshots(trained, tm
     with ThreadPoolExecutor(2) as executor:
         results = list(executor.map(lambda _: reloaded.predict(matrix=matrix)['items'], range(2)))
     assert results == [expected, expected]
-    with pytest.raises(ValueError, match='model_version'):
-        manager.require('old')
+    assert sorted(path.name for path in tmp_path.iterdir()) == ['active.json']
+    manager.clear()
+    assert not (tmp_path / 'active.json').exists()
+    with pytest.raises(LookupError):
+        manager.require()
 
 
 def test_invalid_matrix_and_training_data():
@@ -103,7 +107,7 @@ def test_inline_api_persistence_validation_and_model_schema(setup, trained):
     metadata = client.get('/api/v1/ml/model').json()
     assert metadata['features'] == artifact['features'] and 'booster' not in metadata
     raw = [{key: value for key, value in row.items() if key != 'Label'} for row in blocks[4]]
-    body = {'model_version': artifact['model_version'], 'records': raw, 'persist': True, 'input_format': 'raw'}
+    body = {'records': raw, 'persist': True, 'input_format': 'raw'}
     result = client.post('/api/v1/ml/predict', json=body)
     assert result.status_code == 200, result.text
     assert len(result.json()['items']) == 10000
@@ -112,15 +116,15 @@ def test_inline_api_persistence_validation_and_model_schema(setup, trained):
     assert db.ml_predictions.find_one({'_id': raw[1]['original_id']})['predicted_label'] == 1
     assert client.post('/api/v1/ml/predict', json=body).status_code == 200
     assert db.ml_predictions.count_documents({}) == 10000
-    assert client.post('/api/v1/ml/predict', json={**body, 'model_version': 'old'}).status_code == 409
+    assert client.post('/api/v1/ml/predict', json={**body, 'model_version': 'old'}).status_code == 422
     assert client.post('/api/v1/ml/predict', json={**body, 'records': []}).status_code == 422
     assert client.post('/api/v1/ml/predict', json={**body, 'records': raw + [raw[0]]}).status_code == 422
     assert client.post('/api/v1/ml/predict', json={**body, 'records': [raw[0], raw[0]]}).status_code == 422
     matrix = np.zeros((10000, len(artifact['features']))).tolist()
     assert client.post('/api/v1/ml/predict-matrix', json={
-        'model_version': artifact['model_version'], 'matrix': matrix}).status_code == 200
+        'matrix': matrix}).status_code == 200
     assert client.post('/api/v1/ml/predict-matrix', json={
-        'model_version': artifact['model_version'], 'matrix': [[0]]}).status_code == 422
+        'matrix': [[0]]}).status_code == 422
 
 
 def test_database_training_and_restart(setup, trained):
@@ -133,23 +137,25 @@ def test_database_training_and_restart(setup, trained):
     assert result.status_code == 202
     status = client.get('/api/v1/ml/training/runs/' + result.json()['id']).json()
     assert status['status'] == 'completed', status
-    version = status['model_version']
-    assert client.get('/api/v1/ml/model').json()['model_version'] == version
+    trained_at = client.get('/api/v1/ml/model').json()['created_at']
+    assert result.json()['id'] == 'current'
+    assert 'model_version' not in status
     assert db.dataset_records.find_one({'_id': originals[1]['_id']})['Label'] == 'attack'
     db.ml_training_runs.insert_one({'_id': 'interrupted', 'status': 'running'})
     with TestClient(create_app(config)) as restarted:
-        assert restarted.get('/api/v1/ml/model').json()['model_version'] == version
+        assert restarted.get('/api/v1/ml/model').json()['created_at'] == trained_at
         assert db.ml_training_runs.find_one({'_id': 'interrupted'})['status'] == 'interrupted'
 
 
-def test_training_failure_preserves_active_model_and_unlocks(setup, trained):
+def test_training_failure_clears_active_model_and_unlocks(setup, trained):
     client, db, _ = setup
     artifact, _ = trained
     client.app.state.ml.publish(artifact)
     response = client.post('/api/v1/ml/training/runs', json={})
     status = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
     assert status['status'] == 'failed'
-    assert client.app.state.ml.require().version == artifact['model_version']
+    assert client.app.state.ml.active is None
+    assert not (client.app.state.ml.directory / 'active.json').exists()
     assert not client.app.state.ml.training_lock.locked()
     assert not client.app.state.import_lock.locked()
     client.app.state.import_lock.acquire()
@@ -193,19 +199,19 @@ def test_preprocessing_nearly_equal_large_bounds_uses_decimal():
 
 def test_grouped_classes_split_without_breaking_or_duplicating_blocks():
     blocks = [[{'Label': 'benign', '_id': f'{b}-{i}'} for i in range(10)] for b in range(6)]
-    blocks += [[{'Label': 'attack', '_id': f'{b}-{i}'} for i in range(10)] for b in range(6, 9)]
+    blocks += [[{'Label': 'attack', '_id': f'{b}-{i}'} for i in range(10)] for b in range(6, 10)]
     partitions, indices = split_blocks(blocks)
-    assert sorted(index for group in indices for index in group) == list(range(9))
+    assert sorted(index for group in indices for index in group) == list(range(10))
     for part, group in zip(partitions, indices):
         assert {row['Label'] for block in part for row in block} == {'benign', 'attack'}
         assert all(block is blocks[index] for block, index in zip(part, group))
     assert indices == split_blocks(blocks)[1]
 
 
-@pytest.mark.parametrize('mixed', [0, 1, 2, 3])
+@pytest.mark.parametrize('mixed', [0, 1, 2, 3, 4])
 def test_minimum_class_coverage_and_adjusted_partition_sizes(mixed):
     blocks = [[{'Label': 'benign'}, {'Label': 'attack'}] for _ in range(mixed)]
-    blocks += [[{'Label': label}] for label in ['benign', 'attack'] for _ in range(3 - mixed)]
+    blocks += [[{'Label': label}] for label in ['benign', 'attack'] for _ in range(4 - mixed)]
     while len(blocks) < 5:
         blocks.append([{'Label': 'benign'}, {'Label': 'attack'}])
     partitions, indices = split_blocks(blocks)
@@ -215,40 +221,40 @@ def test_minimum_class_coverage_and_adjusted_partition_sizes(mixed):
 
 def test_insufficient_independent_class_blocks_is_actionable():
     blocks = [[{'Label': 'benign'}]] * 8 + [[{'Label': 'attack'}]] * 2
-    with pytest.raises(ValueError, match='at least 3 distinct complete blocks') as error:
+    with pytest.raises(ValueError, match='at least 4 distinct complete blocks') as error:
         split_blocks(blocks)
     assert 'benign=8, attack=2, mixed=0' in str(error.value)
 
 
 def test_sampling_reaches_late_class_beyond_record_cap(setup):
     client, db, _ = setup
-    # All first 60000 rows are benign; attack blocks occur beyond the old prefix cap.
-    originals = [{'_id': f'{b:02}-{i:05}', 'Label': 'benign' if b < 6 else 'attack',
-                  'signal': '0' if b < 6 else '1'} for b in range(9) for i in range(10000)]
+    # All first 80000 rows are benign; attack blocks occur beyond the old prefix cap.
+    originals = [{'_id': f'{b:02}-{i:05}', 'Label': 'benign' if b < 8 else 'attack',
+                  'signal': '0' if b < 8 else '1'} for b in range(12) for i in range(10000)]
     db.dataset_records.insert_many(originals)
     db.standard_records.insert_many([standard_row(row['_id'], int(row['Label'] == 'attack')) for row in originals])
     diagnostics = {}
-    chosen = list(training_blocks(db, 60000, diagnostics))
-    assert len(chosen) == 6 and all(len(block) == 10000 for block in chosen)
-    assert diagnostics['complete_blocks_scanned'] == 9
-    assert diagnostics['block_classes'] == {'benign': 6, 'attack': 3, 'mixed': 0}
-    assert diagnostics['selected_block_classes'] == {'benign': 3, 'attack': 3, 'mixed': 0}
-    assert max(diagnostics['selected_source_block_indices']) >= 6
-    assert len({row['_id'] for block in chosen for row in block}) == 60000
+    chosen = list(training_blocks(db, 80000, diagnostics))
+    assert len(chosen) == 8 and all(len(block) == 10000 for block in chosen)
+    assert diagnostics['complete_blocks_scanned'] == 12
+    assert diagnostics['block_classes'] == {'benign': 8, 'attack': 4, 'mixed': 0}
+    assert diagnostics['selected_block_classes'] == {'benign': 4, 'attack': 4, 'mixed': 0}
+    assert max(diagnostics['selected_source_block_indices']) >= 8
+    assert len({row['_id'] for block in chosen for row in block}) == 80000
     # Full API training must succeed with the same cap, preserve data, and publish class diagnostics.
-    response = client.post('/api/v1/ml/training/runs', json={'max_records': 60000, 'rounds': 10})
+    response = client.post('/api/v1/ml/training/runs', json={'max_records': 80000, 'rounds': 10})
     status = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
     assert status['status'] == 'completed', status
-    assert status['sampling']['complete_blocks_scanned'] == 9
+    assert status['sampling']['complete_blocks_scanned'] == 12
     metadata = client.get('/api/v1/ml/model').json()
     assert all(counts['benign'] > 0 and counts['attack'] > 0
                for counts in metadata['split']['class_counts'].values())
     # Five pure blocks cannot cover two classes in three independent partitions.
     response = client.post('/api/v1/ml/training/runs', json={'max_records': 50000, 'rounds': 10})
     failed = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
-    assert failed['status'] == 'failed' and '60000' in failed['error']
-    assert failed['sampling']['block_classes']['attack'] == 3
-    assert client.get('/api/v1/ml/model').json()['model_version'] == metadata['model_version']
+    assert failed['status'] == 'failed' and '80000' in failed['error']
+    assert failed['sampling']['block_classes']['attack'] == 4
+    assert client.get('/api/v1/ml/model').status_code == 503
 
 
 def standard_row(key, label, informative=True):
@@ -288,16 +294,16 @@ def test_standard_training_uses_stored_behavior_and_never_reads_raw(setup, monke
         record = standard_row('new', label)
         record.pop('Label')
         prediction = client.post('/api/v1/ml/predict', json={
-            'model_version': model['model_version'], 'records': [record]})
+            'records': [record]})
         assert prediction.status_code == 200, prediction.text
         assert prediction.json()['items'][0]['predicted_label'] == label
         assert prediction.json()['items'][0]['original_id'] == 'new'
     response = client.post('/api/v1/ml/predict', json={
-        'model_version': model['model_version'], 'records': [{'n': '1'}], 'input_format': 'raw'})
+        'records': [{'n': '1'}], 'input_format': 'raw'})
     assert response.status_code == 422
 
 
-def test_constant_model_is_rejected_and_prior_model_preserved(setup, trained):
+def test_constant_model_is_rejected_without_retaining_prior_model(setup, trained):
     client, db, _ = setup
     prior, _ = trained
     client.app.state.ml.publish(prior)
@@ -307,11 +313,9 @@ def test_constant_model_is_rejected_and_prior_model_preserved(setup, trained):
     result = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
     assert result['status'] == 'rejected', result
     assert not result['acceptance']['accepted']
-    assert result['diagnostics']['test']['raw_auc'] == 0.5
-    assert result['diagnostics']['test']['probability_min'] == pytest.approx(0.5)
-    assert result['diagnostics']['test']['probability_max'] == pytest.approx(0.5)
-    assert result['diagnostics']['test']['predicted_benign'] == 0
-    assert client.app.state.ml.require().version == prior['model_version']
+    assert 'All training features are constant' in result['acceptance']['reasons'][0]
+    assert client.app.state.ml.active is None
+    assert not (client.app.state.ml.directory / 'active.json').exists()
     assert not client.app.state.import_lock.locked()
 
 
@@ -321,9 +325,62 @@ def test_legacy_degenerate_active_model_is_not_served(setup, trained):
     bad = {**artifact, 'test_metrics': {'roc_auc': 0.5, 'confusion_matrix': [[0, 11069], [0, 8931]]}}
     client.app.state.ml.publish(bad)
     response = client.post('/api/v1/ml/predict-matrix', json={
-        'model_version': bad['model_version'], 'matrix': [[0] * len(bad['features'])]})
+        'matrix': [[0] * len(bad['features'])]})
     assert response.status_code == 503
     assert 'retrain' in response.json()['detail']
     metadata = client.get('/api/v1/ml/model').json()
     assert metadata['serving_eligible'] is False
     assert metadata['test_metrics']['roc_auc'] == 0.5
+
+
+def test_comparison_calibration_and_weight_selection(trained):
+    from app.services.machine_learning import choose_weight
+    artifact, _ = trained
+    assert set(artifact['evaluation']) == {'lightgbm', 'catboost', 'ensemble'}
+    for metrics in artifact['evaluation'].values():
+        assert metrics['roc_auc'] > 0.95
+        assert metrics['false_positive_rate'] < 0.05
+        assert sum(map(sum, metrics['confusion_matrix'])) == artifact['split']['test_rows']
+    assert artifact['ensemble']['lightgbm_weight'] + artifact['ensemble']['catboost_weight'] == 1
+    assert set(artifact['base_calibration']) == {'lightgbm', 'catboost'}
+    assert set(artifact['feature_importance_catboost']) == set(artifact['features'])
+    groups = artifact['split']['block_indices']
+    assert set(groups) == {'train', 'validation', 'calibration', 'test'}
+    assert sorted(index for group in groups.values() for index in group) == list(range(5))
+    # Weight selection must favor the informative model, not force a 50/50 blend.
+    labels = np.asarray([0, 1, 0, 1])
+    weight, scores = choose_weight(np.asarray([0.1, 0.9, 0.1, 0.9]), np.asarray([0.9, 0.1, 0.9, 0.1]), labels)
+    assert weight == 1 and len(scores) == 11
+    assert 'model_version' not in artifact
+
+
+def test_new_training_replaces_report_and_predictions(setup, trained):
+    client, db, _ = setup
+    artifact, _ = trained
+    client.app.state.ml.publish(artifact)
+    db.ml_training_runs.insert_one({'_id': 'old-report', 'status': 'completed'})
+    db.ml_predictions.insert_one({'_id': 'old-result', 'predicted_label': 1})
+    response = client.post('/api/v1/ml/training/runs', json={'max_records': 50000, 'rounds': 10})
+    assert response.json()['id'] == 'current'
+    assert list(db.ml_training_runs.distinct('_id')) == ['current']
+    assert db.ml_predictions.count_documents({}) == 0
+    assert client.app.state.ml.active is None
+    assert not (client.app.state.ml.directory / 'active.json').exists()
+    assert client.get('/api/v1/ml/model').status_code == 503
+
+
+def test_reset_during_prediction_does_not_store_old_results(setup, trained, monkeypatch):
+    client, db, _ = setup
+    artifact, blocks = trained
+    manager = client.app.state.ml
+    manager.publish(artifact)
+    original = Predictor.predict
+    def reset_before_return(predictor, *args, **kwargs):
+        result = original(predictor, *args, **kwargs)
+        manager.clear()
+        return result
+    monkeypatch.setattr(Predictor, 'predict', reset_before_return)
+    response = client.post('/api/v1/ml/predict', json={
+        'records': blocks[4][:1], 'input_format': 'raw', 'persist': True})
+    assert response.status_code == 503
+    assert db.ml_predictions.count_documents({}) == 0

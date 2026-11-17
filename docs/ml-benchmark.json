@@ -1,47 +1,214 @@
 {
   "synthetic": true,
   "threads": 2,
-  "features": 85,
-  "trees": 150,
+  "features": 84,
+  "trees": {
+    "lightgbm": 91,
+    "catboost": 309
+  },
   "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
-  "model_version": "aa52520ef00e42008515dfd2743761f4",
   "batch_size": 10000,
-  "repeats": 20,
+  "repeats": 10,
+  "evaluation": {
+    "lightgbm": {
+      "precision": 0.7679558011049724,
+      "recall": 0.8039489429597128,
+      "f1": 0.7855402903634415,
+      "accuracy": 0.7799,
+      "false_positive_rate": 0.24428399518652227,
+      "roc_auc": 0.8570604793541583,
+      "average_precision": 0.8493838652291098,
+      "brier_score": 0.1539446461702618,
+      "log_loss": 0.4731586163079154,
+      "confusion_matrix": [
+        [
+          3768,
+          1218
+        ],
+        [
+          983,
+          4031
+        ]
+      ],
+      "raw_auc": 0.8570604793541583
+    },
+    "catboost": {
+      "precision": 0.793158953722334,
+      "recall": 0.7861986437973674,
+      "f1": 0.7896634615384616,
+      "accuracy": 0.79,
+      "false_positive_rate": 0.20617729643000401,
+      "roc_auc": 0.8718467152782479,
+      "average_precision": 0.8671118388020944,
+      "brier_score": 0.14494449084573935,
+      "log_loss": 0.4488751901974705,
+      "confusion_matrix": [
+        [
+          3958,
+          1028
+        ],
+        [
+          1072,
+          3942
+        ]
+      ],
+      "raw_auc": 0.8718467152782479
+    },
+    "ensemble": {
+      "precision": 0.793158953722334,
+      "recall": 0.7861986437973674,
+      "f1": 0.7896634615384616,
+      "accuracy": 0.79,
+      "false_positive_rate": 0.20617729643000401,
+      "roc_auc": 0.8718467152782479,
+      "average_precision": 0.8671118388020944,
+      "brier_score": 0.14494449084573935,
+      "log_loss": 0.4488751901974705,
+      "confusion_matrix": [
+        [
+          3958,
+          1028
+        ],
+        [
+          1072,
+          3942
+        ]
+      ],
+      "raw_auc": 0.8718467152782479
+    }
+  },
+  "ensemble": {
+    "method": "weighted raw probabilities followed by Platt calibration",
+    "lightgbm_weight": 0.0,
+    "catboost_weight": 1.0,
+    "selection_metric": "validation_log_loss",
+    "validation_scores": [
+      {
+        "lightgbm_weight": 0.0,
+        "log_loss": 0.4543357749598539
+      },
+      {
+        "lightgbm_weight": 0.1,
+        "log_loss": 0.4551389149053868
+      },
+      {
+        "lightgbm_weight": 0.2,
+        "log_loss": 0.456300991563018
+      },
+      {
+        "lightgbm_weight": 0.30000000000000004,
+        "log_loss": 0.4577961105229003
+      },
+      {
+        "lightgbm_weight": 0.4,
+        "log_loss": 0.45960774223628703
+      },
+      {
+        "lightgbm_weight": 0.5,
+        "log_loss": 0.46172594272765854
+      },
+      {
+        "lightgbm_weight": 0.6000000000000001,
+        "log_loss": 0.46414587758066134
+      },
+      {
+        "lightgbm_weight": 0.7000000000000001,
+        "log_loss": 0.4668670562323052
+      },
+      {
+        "lightgbm_weight": 0.8,
+        "log_loss": 0.4698930258687771
+      },
+      {
+        "lightgbm_weight": 0.9,
+        "log_loss": 0.47323143216597935
+      },
+      {
+        "lightgbm_weight": 1.0,
+        "log_loss": 0.4768944564919089
+      }
+    ]
+  },
+  "acceptance": {
+    "accepted": true,
+    "reasons": [],
+    "policy": "reject degenerate candidates; not a production accuracy guarantee"
+  },
+  "split": {
+    "order": "deterministic class-covered whole-block split; not chronological",
+    "seed": 42,
+    "block_indices": {
+      "train": [
+        1,
+        3
+      ],
+      "validation": [
+        2
+      ],
+      "calibration": [
+        4
+      ],
+      "test": [
+        0
+      ]
+    },
+    "class_counts": {
+      "train": {
+        "benign": 9903,
+        "attack": 10097
+      },
+      "validation": {
+        "benign": 4956,
+        "attack": 5044
+      },
+      "calibration": {
+        "benign": 5065,
+        "attack": 4935
+      },
+      "test": {
+        "benign": 4986,
+        "attack": 5014
+      }
+    },
+    "train_rows": 20000,
+    "validation_rows": 10000,
+    "calibration_rows": 10000,
+    "test_rows": 10000
+  },
   "raw_service": {
-    "p50_ms": 579.2607789990143,
-    "p95_ms": 1478.6501666514616,
-    "max_ms": 4254.760204999911,
-    "eps_at_p95": 6762.924879416146
+    "p50_ms": 458.2090520016209,
+    "p95_ms": 662.7187080499424,
+    "max_ms": 715.8968330004427,
+    "eps_at_p95": 15089.358242843511
   },
   "matrix_service": {
-    "p50_ms": 17.07207350045792,
-    "p95_ms": 19.408586853023735,
-    "max_ms": 20.087054999748943,
-    "eps_at_p95": 515235.8631634257
+    "p50_ms": 48.06581249977171,
+    "p95_ms": 55.41629015096987,
+    "max_ms": 56.09265500243055,
+    "eps_at_p95": 180452.35386124064
   },
   "native_inference": {
-    "p50_ms": 12.596845499501796,
-    "p95_ms": 16.936033747333568,
-    "max_ms": 17.79534199886257,
-    "eps_at_p95": 590457.0189920892
+    "p50_ms": 46.6966380008671,
+    "p95_ms": 91.86473190038666,
+    "max_ms": 105.65336999934516,
+    "eps_at_p95": 108855.7033056329
   },
   "raw_http_no_persistence": {
-    "p50_ms": 713.7863659991126,
-    "p95_ms": 954.4007993994456,
-    "max_ms": 1069.5404079997388,
-    "eps_at_p95": 10477.778315244996
+    "p50_ms": 758.7899084992387,
+    "p95_ms": 852.6270970509358,
+    "max_ms": 861.2028060015291,
+    "eps_at_p95": 11728.456712891217
   },
   "raw_http_with_mongodb_write": {
-    "p50_ms": 1010.9079480007495,
-    "p95_ms": 1346.216610099691,
-    "max_ms": 1456.3058610001463,
-    "eps_at_p95": 7428.225090210017
+    "p50_ms": 1148.4405265000532,
+    "p95_ms": 1356.4370822003182,
+    "max_ms": 1429.911112998525,
+    "eps_at_p95": 7372.254954707293
   },
   "matrix_http": {
-    "p50_ms": 315.8492090005893,
-    "p95_ms": 468.47813079857593,
-    "max_ms": 562.8151599994453,
-    "eps_at_p95": 21345.713583158784
-  },
-  "dataset_note": "Synthetic 50000-row training set; 10000-row requests; simple separable signal, 85 input features, CPU quota 4 cores. No production accuracy or latency guarantee."
+    "p50_ms": 353.62291949968494,
+    "p95_ms": 444.66801255039167,
+    "max_ms": 459.9425609994796,
+    "eps_at_p95": 22488.687555115644
+  }
 }
