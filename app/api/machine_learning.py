@@ -3,10 +3,13 @@ from time import perf_counter
 from uuid import UUID, uuid4
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response, Query
 import orjson
 from pydantic import BaseModel, Field
 from pymongo import UpdateOne
+from pymongo.errors import ExecutionTimeout, NetworkTimeout
+
+from app.services.ml_diagnostics import data_diagnostics
 
 from app.api.logs import DB
 from app.services.machine_learning import training_job
@@ -122,3 +125,14 @@ def predict_matrix(body: MatrixRequest, request: Request):
         return Response(orjson.dumps(predictor.predict(matrix=body.matrix)), media_type='application/json')
     except (ValueError, TypeError, OverflowError) as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@router.get('/data-diagnostics', summary='آمار فقط‌خواندنی کلاس‌ها و ویژگی‌های استاندارد؛ بدون نیاز به mongosh')
+def inspect_data(database: DB, sample_size: int = Query(20000, ge=1, le=50000),
+                 full_label_counts: bool = Query(False),
+                 max_time_ms: int = Query(30000, ge=1000, le=120000)):
+    try:
+        return data_diagnostics(database, sample_size, full_label_counts, max_time_ms)
+    except (ExecutionTimeout, NetworkTimeout) as exc:
+        raise HTTPException(504, 'Diagnostics timed out; reduce sample_size or disable full_label_counts. '
+                            'max_time_ms is per aggregation and the MongoDB socket timeout also applies.') from exc
