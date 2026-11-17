@@ -22,8 +22,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        client = MongoClient(config.mongodb_uri, tz_aware=True, serverSelectionTimeoutMS=3000,
-                             connectTimeoutMS=3000, socketTimeoutMS=5000)
+        client = MongoClient(config.mongodb_uri, tz_aware=True, serverSelectionTimeoutMS=config.mongodb_server_selection_timeout_ms,
+                             connectTimeoutMS=config.mongodb_connect_timeout_ms,
+                             socketTimeoutMS=config.mongodb_socket_timeout_ms)
         app.state.database = client[config.mongodb_database]
         try:
             def initialize():

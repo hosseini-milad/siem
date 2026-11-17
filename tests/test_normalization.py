@@ -155,3 +155,45 @@ def test_startup_records_interruption_reason(setup, caplog):
         assert 'Server started again' in result['interruption_reason']
         assert result['interrupted_at'] is not None
     assert 'previous normalization runs interrupted' in caplog.text
+
+
+def test_resume_uses_estimate_without_exact_count_or_refit(setup, monkeypatch):
+    from app.services import normalization
+    from pymongo.collection import Collection
+    from pymongo.errors import NetworkTimeout
+
+    client, db = setup
+    db.dataset_records.insert_many([
+        {'_id': 'a', 'Label': 'benign', 'value': '0'},
+        {'_id': 'b', 'Label': 'attack', 'value': '10'},
+    ])
+    assert run(client)['status'] == 'completed'
+    parameters = db.normalization_parameters.find_one({'_id': 'default'})
+    before = list(db.normal_records.find().sort('_id', 1))
+    db.dataset_records.update_one({'_id': 'a'}, {'$set': {'Label': ''}})
+    db.dataset_records.insert_one({'_id': 'c', 'Label': 'benign', 'value': '5'})
+    estimate_calls = []
+
+    def estimate(collection, *args, **kwargs):
+        assert collection.name == 'dataset_records'
+        estimate_calls.append(collection.name)
+        return 100  # Deliberately different from the exact count.
+
+    def exact_count(*args, **kwargs):
+        raise NetworkTimeout('Exact counting must not block normalization')
+
+    def refit(*args, **kwargs):
+        pytest.fail('Persisted Fit parameters must be reused')
+
+    monkeypatch.setattr(Collection, 'count_documents', exact_count)
+    monkeypatch.setattr(Collection, 'estimated_document_count', estimate)
+    monkeypatch.setattr(normalization, 'fit', refit)
+    status = run(client)
+    assert status['status'] == 'completed', status
+    assert status['total'] == status['total_estimate'] == 100
+    assert estimate_calls == ['dataset_records']
+    assert status['processed'] == 1 and status['skipped'] == 2
+    assert status['scanned'] == 3
+    assert db.normalization_parameters.find_one({'_id': 'default'}) == parameters
+    assert list(db.normal_records.find({'_id': {'$in': ['a', 'b']}}).sort('_id', 1)) == before
+    assert db.normal_records.find_one({'_id': 'c'})['value'] == 0.5

@@ -167,7 +167,7 @@ def normalize(db, job_id):
         logger.info('Normalization %s schema ready; preparing output index', job_id)
         db.normal_records.create_index('original_id', unique=True)
         db.normalization_runs.update_one({'_id': job_id}, {'$set': {
-            'total': db.dataset_records.count_documents({}), 'schema': schema, 'phase': 'transform', 'scanned': 0, 'heartbeat_at': datetime.now(timezone.utc)}})
+            'total': total, 'schema': schema, 'phase': 'transform', 'scanned': 0, 'heartbeat_at': datetime.now(timezone.utc)}})
         logger.info('Normalization %s transform started', job_id)
         reported = monotonic()
 
