@@ -8,7 +8,9 @@ from statistics import mean, pstdev
 from pymongo import ReplaceOne
 
 BLOCK_SIZE = 10000
-FEATURE_FIELD = 'behavior_features'
+FEATURE_VERSION = 2
+BOUNDED_FEATURES = {'source_record_share', 'source_ip_available',
+                    'destination_ip_available', 'timestamp_available'}
 logger = logging.getLogger('uvicorn.error.siem.standardization')
 
 
@@ -100,47 +102,96 @@ def block_features(originals):
     return features
 
 
+def feature_blocks(db):
+    """Re-read a stable input with bounded memory for fit and transform."""
+    def enrich(block, index):
+        originals = {}
+        for offset in range(0, len(block), 500):
+            ids = [row['original_id'] for row in block[offset:offset + 500]]
+            originals.update((row['_id'], row) for row in db.dataset_records.find({'_id': {'$in': ids}}))
+        if any(row['original_id'] not in originals for row in block):
+            raise ValueError('An original dataset_records document is missing; no features written for this block')
+        features = block_features([originals[row['original_id']] for row in block])
+        for row, feature in zip(block, features):
+            feature['block_index'] = index
+            if set(row) & (set(feature) | {'behavior_features'}):
+                raise ValueError('Input contains a reserved behavioral feature name; source fields must not be overwritten')
+            if any(not math.isfinite(value) for value in feature.values()):
+                raise ValueError('Nonfinite behavioral feature; check source time and volume values')
+        return block, features
+
+    block = []
+    index = 0
+    for row in db.normal_records.find().sort('_id', 1).batch_size(500):
+        block.append(row)
+        if len(block) == BLOCK_SIZE:
+            yield enrich(block, index)
+            index += 1
+            block = []
+    if block:
+        yield enrich(block, index)
+
+
+def scale_features(features, bounds):
+    result = {}
+    if set(features) != set(bounds):
+        raise ValueError('Saved behavioral scaling schema does not match current features')
+    for name, value in features.items():
+        if not math.isfinite(value):
+            raise ValueError('Nonfinite behavioral feature')
+        low, high = bounds[name]['min'], bounds[name]['max']
+        # Preserve flags and natural proportions; other features follow frozen Min-Max.
+        scaled = value if name in BOUNDED_FEATURES else ((value - low) / (high - low) if high != low else 0.0)
+        if not math.isfinite(scaled):
+            raise ValueError('Nonfinite scaled behavioral feature')
+        result[name] = max(0.0, min(1.0, scaled))
+    return result
+
+
 def standardize(db, job_id):
     processed = blocks = 0
     jobs = db.standardization_runs
     try:
         db.standard_records.create_index('original_id', unique=True)
         jobs.update_one({'_id': job_id}, {'$set': {
-            'phase': 'enrich', 'started_at': datetime.now(timezone.utc),
+            'phase': 'fit', 'started_at': datetime.now(timezone.utc),
             'total_estimate': db.normal_records.estimated_document_count(),
-            'block_size': BLOCK_SIZE, 'order': '_id ascending', 'feature_version': 1}})
-
-        def consume(block):
-            nonlocal processed, blocks
-            originals = {}
+            'block_size': BLOCK_SIZE, 'order': '_id ascending', 'feature_version': FEATURE_VERSION}})
+        parameters = db.standardization_parameters.find_one({'_id': 'default'})
+        if parameters is None:
+            bounds = {}
+            scanned = 0
+            for block, features in feature_blocks(db):
+                for feature in features:
+                    for name, value in feature.items():
+                        stat = bounds.setdefault(name, {'min': value, 'max': value})
+                        stat['min'] = min(stat['min'], value)
+                        stat['max'] = max(stat['max'], value)
+                scanned += len(block)
+                jobs.update_one({'_id': job_id}, {'$set': {
+                    'scanned': scanned, 'heartbeat_at': datetime.now(timezone.utc)}})
+            if bounds:  # An empty run must not freeze an empty schema.
+                db.standardization_parameters.update_one({'_id': 'default'}, {'$setOnInsert': {
+                    'bounds': bounds, 'feature_version': FEATURE_VERSION,
+                    'created_at': datetime.now(timezone.utc)}}, upsert=True)
+                parameters = db.standardization_parameters.find_one({'_id': 'default'})
+        if parameters is not None and parameters['feature_version'] != FEATURE_VERSION:
+            raise ValueError('Unsupported saved behavioral feature version')
+        bounds = parameters['bounds'] if parameters is not None else {}
+        jobs.update_one({'_id': job_id}, {'$set': {
+            'phase': 'transform', 'scaling_bounds': bounds, 'scanned': 0}})
+        for block, features in feature_blocks(db):
+            scaled = [scale_features(feature, bounds) for feature in features]
             for offset in range(0, len(block), 500):
-                ids = [row['original_id'] for row in block[offset:offset + 500]]
-                originals.update((row['_id'], row) for row in db.dataset_records.find({'_id': {'$in': ids}}))
-            if any(FEATURE_FIELD in row for row in block):
-                raise ValueError('Input already contains reserved behavior_features field')
-            if any(row['original_id'] not in originals for row in block):
-                raise ValueError('An original dataset_records document is missing; no features written for this block')
-            features = block_features([originals[row['original_id']] for row in block])
-            for feature in features:
-                feature['block_index'] = blocks
-            for offset in range(0, len(block), 500):
-                operations = [ReplaceOne({'_id': row['_id']}, {**row, FEATURE_FIELD: feature}, upsert=True)
-                              for row, feature in zip(block[offset:offset + 500], features[offset:offset + 500])]
+                operations = [ReplaceOne({'_id': row['_id']}, {**row, **feature}, upsert=True)
+                              for row, feature in zip(block[offset:offset + 500], scaled[offset:offset + 500])]
                 db.standard_records.bulk_write(operations)
                 processed += len(operations)
             blocks += 1
             jobs.update_one({'_id': job_id}, {'$set': {
-                'processed': processed, 'blocks': blocks, 'heartbeat_at': datetime.now(timezone.utc)}})
+                'processed': processed, 'scanned': processed, 'blocks': blocks,
+                'heartbeat_at': datetime.now(timezone.utc)}})
             logger.info('Standardization %s processed=%s blocks=%s', job_id, processed, blocks)
-
-        block = []
-        for row in db.normal_records.find().sort('_id', 1).batch_size(500):
-            block.append(row)
-            if len(block) == BLOCK_SIZE:
-                consume(block)
-                block = []
-        if block:
-            consume(block)
         jobs.update_one({'_id': job_id}, {'$set': {
             'status': 'completed', 'phase': 'done', 'processed': processed,
             'blocks': blocks, 'finished_at': datetime.now(timezone.utc)}})

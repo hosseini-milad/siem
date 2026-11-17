@@ -19,7 +19,7 @@ def start(request: Request, tasks: BackgroundTasks, database: DB):
         raise HTTPException(409, 'An import, normalization or standardization is already running')
     job_id = str(uuid4())
     try:
-        database.standardization_runs.insert_one({'_id': job_id, 'status': 'running', 'phase': 'enrich',
+        database.standardization_runs.insert_one({'_id': job_id, 'status': 'running', 'phase': 'fit',
             'processed': 0, 'blocks': 0, 'worker_pid': os.getpid(), 'created_at': datetime.now(timezone.utc)})
     except Exception:
         request.app.state.import_lock.release()
