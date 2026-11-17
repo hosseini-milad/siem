@@ -9,7 +9,7 @@ from pymongo import MongoClient
 from app.core.config import Settings
 from app.main import create_app
 from app.services.machine_learning import (ModelManager, Predictor, feature_matrix, prepare_raw,
-                                            train, training_job, validate_matrix)
+                                            train, training_job, validate_matrix, split_blocks, training_blocks)
 
 
 def synthetic_blocks():
@@ -44,7 +44,9 @@ def test_train_only_scaling_calibration_and_quality(trained):
     assert artifact['split']['train_rows'] == 30000
     assert artifact['split']['calibration_rows'] == artifact['split']['test_rows'] == 10000
     timestamp = next(stat for stat in artifact['normalization_schema'] if stat['field'] == 'Timestamp')
-    assert timestamp['max'] == '29999'
+    train_indices = artifact['split']['block_indices']['train']
+    assert timestamp['max'] == str(max(train_indices) * 10000 + 9999)
+    assert set(train_indices).isdisjoint(artifact['split']['block_indices']['test'])
     assert artifact['test_metrics']['recall'] > 0.95
     assert artifact['test_metrics']['precision'] > 0.95
     assert artifact['calibration']['method'] == 'Platt'
@@ -185,3 +187,64 @@ def test_preprocessing_nearly_equal_large_bounds_uses_decimal():
     _, schema = fit_rows(rows)
     prepared, _ = prepare_raw(rows, schema)
     assert prepared[0]['value'] == 0 and prepared[1]['value'] == 1
+
+
+def test_grouped_classes_split_without_breaking_or_duplicating_blocks():
+    blocks = [[{'Label': 'benign', '_id': f'{b}-{i}'} for i in range(10)] for b in range(6)]
+    blocks += [[{'Label': 'attack', '_id': f'{b}-{i}'} for i in range(10)] for b in range(6, 9)]
+    partitions, indices = split_blocks(blocks)
+    assert sorted(index for group in indices for index in group) == list(range(9))
+    for part, group in zip(partitions, indices):
+        assert {row['Label'] for block in part for row in block} == {'benign', 'attack'}
+        assert all(block is blocks[index] for block, index in zip(part, group))
+    assert indices == split_blocks(blocks)[1]
+
+
+@pytest.mark.parametrize('mixed', [0, 1, 2, 3])
+def test_minimum_class_coverage_and_adjusted_partition_sizes(mixed):
+    blocks = [[{'Label': 'benign'}, {'Label': 'attack'}] for _ in range(mixed)]
+    blocks += [[{'Label': label}] for label in ['benign', 'attack'] for _ in range(3 - mixed)]
+    while len(blocks) < 5:
+        blocks.append([{'Label': 'benign'}, {'Label': 'attack'}])
+    partitions, indices = split_blocks(blocks)
+    assert sorted(index for group in indices for index in group) == list(range(len(blocks)))
+    assert all({row['Label'] for block in part for row in block} == {'benign', 'attack'} for part in partitions)
+
+
+def test_insufficient_independent_class_blocks_is_actionable():
+    blocks = [[{'Label': 'benign'}]] * 8 + [[{'Label': 'attack'}]] * 2
+    with pytest.raises(ValueError, match='at least 3 distinct complete blocks') as error:
+        split_blocks(blocks)
+    assert 'benign=8, attack=2, mixed=0' in str(error.value)
+
+
+def test_sampling_reaches_late_class_beyond_record_cap(setup):
+    client, db, _ = setup
+    # All first 60000 rows are benign; attack blocks occur beyond the old prefix cap.
+    originals = [{'_id': f'{b:02}-{i:05}', 'Label': 'benign' if b < 6 else 'attack',
+                  'signal': '0' if b < 6 else '1'} for b in range(9) for i in range(10000)]
+    db.dataset_records.insert_many(originals)
+    db.standard_records.insert_many([{'_id': row['_id'], 'original_id': row['_id'],
+                                      'Label': 0 if row['Label'] == 'benign' else 1} for row in originals])
+    diagnostics = {}
+    chosen = list(training_blocks(db, 60000, diagnostics))
+    assert len(chosen) == 6 and all(len(block) == 10000 for block in chosen)
+    assert diagnostics['complete_blocks_scanned'] == 9
+    assert diagnostics['block_classes'] == {'benign': 6, 'attack': 3, 'mixed': 0}
+    assert diagnostics['selected_block_classes'] == {'benign': 3, 'attack': 3, 'mixed': 0}
+    assert max(diagnostics['selected_source_block_indices']) >= 6
+    assert len({row['_id'] for block in chosen for row in block}) == 60000
+    # Full API training must succeed with the same cap, preserve data, and publish class diagnostics.
+    response = client.post('/api/v1/ml/training/runs', json={'max_records': 60000, 'rounds': 10})
+    status = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
+    assert status['status'] == 'completed', status
+    assert status['sampling']['complete_blocks_scanned'] == 9
+    metadata = client.get('/api/v1/ml/model').json()
+    assert all(counts['benign'] > 0 and counts['attack'] > 0
+               for counts in metadata['split']['class_counts'].values())
+    # Five pure blocks cannot cover two classes in three independent partitions.
+    response = client.post('/api/v1/ml/training/runs', json={'max_records': 50000, 'rounds': 10})
+    failed = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
+    assert failed['status'] == 'failed' and '60000' in failed['error']
+    assert failed['sampling']['block_classes']['attack'] == 3
+    assert client.get('/api/v1/ml/model').json()['model_version'] == metadata['model_version']

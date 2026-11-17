@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
@@ -200,33 +201,131 @@ class ModelManager:
         self.active = predictor
 
 
-def training_blocks(db, max_records):
-    """Use standard_records membership/order, but reconstruct raw data for leakage-free Fit."""
-    block = []
-    for row in db.standard_records.find({}, {'original_id': 1}).sort('_id', 1).limit(max_records).batch_size(500):
-        block.append(row)
-        if len(block) == BLOCK_SIZE:
-            originals = {}
-            for offset in range(0, BLOCK_SIZE, 500):
-                ids = [item['original_id'] for item in block[offset:offset + 500]]
-                originals.update((item['_id'], item) for item in db.dataset_records.find({'_id': {'$in': ids}}))
-            if any(item['original_id'] not in originals for item in block):
-                raise ValueError('A training record has no original dataset_records document')
-            yield [originals[item['original_id']] for item in block]
-            block = []
-    # The final partial block is excluded from training to preserve complete block boundaries.
+def original_rows(db, references, projection=None):
+    originals = {}
+    for offset in range(0, len(references), 500):
+        ids = [item['original_id'] for item in references[offset:offset + 500]]
+        originals.update((item['_id'], item) for item in db.dataset_records.find(
+            {'_id': {'$in': ids}}, projection))
+    if any(item['original_id'] not in originals for item in references):
+        raise ValueError('A training record has no original dataset_records document')
+    return [originals[item['original_id']] for item in references]
+
+
+def coverage_requirements(counts, budget):
+    """Minimum stratum quotas needed to cover both labels in three disjoint splits."""
+    mixed = min(3, counts['mixed'])
+    requirements = {'mixed': mixed, 'benign': 3 - mixed, 'attack': 3 - mixed}
+    description = ', '.join(f'{name}={counts[name]}' for name in ('benign', 'attack', 'mixed'))
+    if any(counts[name] < value for name, value in requirements.items()):
+        raise ValueError('Insufficient independent blocks for both classes in train, calibration and test: '
+                         + description + '. Each class must occur in at least 3 distinct complete blocks; '
+                         'add labelled blocks or complete normalization/standardization. Do not duplicate records.')
+    minimum = sum(requirements.values())
+    if budget < minimum:
+        raise ValueError(f'Block-separated evaluation needs at least {minimum * BLOCK_SIZE} records '
+                         f'for this class distribution ({description}); increase max_records to '
+                         f'{minimum * BLOCK_SIZE} or more.')
+    return requirements
+
+
+def block_kind(labels):
+    classes = set(labels)
+    return 'mixed' if classes == {0, 1} else ('attack' if classes == {1} else 'benign')
+
+
+def training_blocks(db, max_records, diagnostics=None, progress=None):
+    """Scan all block labels; bound retained raw rows, not the scan's prefix."""
+    diagnostics = diagnostics if diagnostics is not None else {}
+    budget = max_records // BLOCK_SIZE
+    rng = random.Random(42)
+    counts = dict.fromkeys(('benign', 'attack', 'mixed'), 0)
+    reservoirs = {name: [] for name in counts}
+    references = []
+    scanned = 0
+    reported = perf_counter()
+    for row in db.standard_records.find({}, {'original_id': 1, 'Label': 1}).sort('_id', 1).batch_size(500):
+        references.append(row)
+        if len(references) != BLOCK_SIZE:
+            continue
+        # Legacy standard_records may not have copied labels; resolve them without loading all features.
+        labelled = references if all('Label' in item for item in references) else original_rows(db, references, {'Label': 1})
+        kind = block_kind(label_value(item) for item in labelled)
+        candidate = {'index': scanned, 'first': references[0]['_id'], 'last': references[-1]['_id']}
+        counts[kind] += 1
+        if len(reservoirs[kind]) < budget:
+            reservoirs[kind].append(candidate)
+        else:
+            slot = rng.randrange(counts[kind])
+            if slot < budget:
+                reservoirs[kind][slot] = candidate
+        scanned += 1
+        references = []
+        diagnostics.update({'complete_blocks_scanned': scanned, 'block_classes': dict(counts), 'seed': 42})
+        if progress and (scanned == 1 or perf_counter() - reported >= 5):
+            progress(dict(diagnostics))
+            reported = perf_counter()
+    diagnostics['trailing_records_ignored'] = len(references)
+    if progress:
+        progress(dict(diagnostics))
+    if scanned < 5:
+        raise ValueError(f'At least five complete 10000-record blocks (50000 records) are required; found {scanned}')
+    quota = coverage_requirements(counts, budget)
+    total = min(budget, scanned)
+    while sum(quota.values()) < total:
+        available = [name for name in counts if quota[name] < counts[name]]
+        name = max(available, key=lambda name: counts[name] * total / scanned - quota[name])
+        quota[name] += 1
+    selected = []
+    for name in counts:
+        rng.shuffle(reservoirs[name])
+        selected.extend(reservoirs[name][:quota[name]])
+    selected.sort(key=lambda candidate: candidate['index'])
+    diagnostics.update({'selected_block_classes': quota, 'selected_source_block_indices': [item['index'] for item in selected]})
+    if progress:
+        progress(dict(diagnostics))
+    for candidate in selected:
+        references = list(db.standard_records.find(
+            {'_id': {'$gte': candidate['first'], '$lte': candidate['last']}},
+            {'original_id': 1}).sort('_id', 1))
+        if len(references) != BLOCK_SIZE:
+            raise ValueError('Training membership changed while sampling; keep the dataset unchanged and retry')
+        yield original_rows(db, references)
+
+
+def split_blocks(blocks):
+    if len(blocks) < 5:
+        raise ValueError('At least five complete 10000-record blocks (50000 records) are required')
+    groups = {'benign': [], 'attack': [], 'mixed': []}
+    for index, block in enumerate(blocks):
+        groups[block_kind(label_value(row) for row in block)].append(index)
+    coverage_requirements({name: len(indices) for name, indices in groups.items()}, len(blocks))
+    rng = random.Random(42)
+    for indices in groups.values():
+        rng.shuffle(indices)
+    indices = [[], [], []]
+    # Seed small holdouts with mixed blocks first; pure blocks require a pair per split.
+    for partition in (2, 1, 0):
+        if groups['mixed']:
+            indices[partition].append(groups['mixed'].pop())
+        else:
+            indices[partition].extend([groups['benign'].pop(), groups['attack'].pop()])
+    targets = [int(len(blocks) * 0.6), int(len(blocks) * 0.2)]
+    targets.append(len(blocks) - sum(targets))
+    remaining = [index for group in groups.values() for index in group]
+    rng.shuffle(remaining)
+    for index in remaining:
+        partition = max(range(3), key=lambda part: targets[part] - len(indices[part]))
+        indices[partition].append(index)
+    for group in indices:
+        group.sort()
+    return [[blocks[index] for index in group] for group in indices], indices
 
 
 def train(blocks, threads, threshold=0.5, rounds=150):
-    if len(blocks) < 5:
-        raise ValueError('At least five complete 10000-record blocks (50000 records) are required')
-    train_end = int(len(blocks) * 0.6)
-    calibration_end = int(len(blocks) * 0.8)
-    partitions = [blocks[:train_end], blocks[train_end:calibration_end], blocks[calibration_end:]]
+    partitions, partition_indices = split_blocks(blocks)
     labels = [np.asarray([label_value(row) for block in part for row in block], dtype=np.int32)
               for part in partitions]
-    if any(set(y.tolist()) != {0, 1} for y in labels):
-        raise ValueError('Train, calibration and test partitions must each contain both classes; preserve block separation')
     _, schema = fit_rows(row for block in partitions[0] for row in block)
     prepared = []
     bounds = {}
@@ -262,7 +361,10 @@ def train(blocks, threads, threshold=0.5, rounds=150):
                 'calibration': {'method': 'Platt', 'coefficient': float(calibration.coef_[0, 0]),
                                 'intercept': float(calibration.intercept_[0])},
                 'feature_importance_gain': dict(zip(names, booster.feature_importance('gain').tolist())),
-                'split': {'order': 'standard_records._id ascending; complete blocks',
+                'split': {'order': 'deterministic class-covered whole-block split; not chronological',
+                          'seed': 42, 'block_indices': dict(zip(('train', 'calibration', 'test'), partition_indices)),
+                          'class_counts': {name: {'benign': int((y == 0).sum()), 'attack': int((y == 1).sum())}
+                                           for name, y in zip(('train', 'calibration', 'test'), labels)},
                           'train_rows': len(labels[0]), 'calibration_rows': len(labels[1]),
                           'test_rows': len(labels[2])}}
     predictor = Predictor(artifact, threads)
@@ -279,11 +381,16 @@ def train(blocks, threads, threshold=0.5, rounds=150):
 
 
 def training_job(db, manager, job_id, max_records, threshold, rounds):
+    sampling = {}
     try:
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {'phase': 'read'}})
-        blocks = list(training_blocks(db, max_records))
+        def progress(details):
+            db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
+                'sampling': details, 'heartbeat_at': datetime.now(timezone.utc)}})
+        blocks = list(training_blocks(db, max_records, sampling, progress))
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {'phase': 'train', 'blocks': len(blocks)}})
         artifact = train(blocks, manager.threads, threshold, rounds)
+        artifact['sampling'] = sampling
         manager.publish(artifact)
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
             'status': 'completed', 'phase': 'done', 'model_version': artifact['model_version'],
@@ -293,7 +400,8 @@ def training_job(db, manager, job_id, max_records, threshold, rounds):
         logger.exception('ML training %s failed', job_id)
         try:
             db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
-                'status': 'failed', 'error': str(exc)[:500] if isinstance(exc, ValueError) else 'Training failed; see console traceback',
+                'status': 'failed', 'sampling': sampling,
+                'error': str(exc)[:500] if isinstance(exc, ValueError) else 'Training failed; see console traceback',
                 'finished_at': datetime.now(timezone.utc)}})
         except Exception:
             logger.exception('Could not record ML training failure')
