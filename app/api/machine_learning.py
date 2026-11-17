@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from time import perf_counter
 from uuid import UUID, uuid4
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 import orjson
@@ -22,6 +23,7 @@ class TrainingRequest(BaseModel):
 class PredictRequest(BaseModel):
     model_version: str
     records: list[dict] = Field(min_length=1, max_length=10000)
+    input_format: Literal['standard', 'raw'] = 'standard'
     persist: bool = False
 
 
@@ -41,8 +43,17 @@ def active(request, version=None):
 
 @router.get('/model', summary='نسخه، ترتیب ویژگی‌ها، پارامترهای پیش‌پردازش و ارزیابی مدل فعال')
 def model(request: Request):
-    artifact = active(request).artifact
-    return {key: value for key, value in artifact.items() if key != 'booster'}
+    predictor = request.app.state.ml.active
+    if predictor is None:
+        raise HTTPException(503, 'No trained model is active')
+    metadata = {key: value for key, value in predictor.artifact.items() if key != 'booster'}
+    try:
+        request.app.state.ml.require()
+        metadata['serving_eligible'] = True
+    except LookupError as exc:
+        metadata['serving_eligible'] = False
+        metadata['serving_block_reason'] = str(exc)
+    return metadata
 
 
 @router.post('/training/runs', status_code=202, summary='آموزش CPU از بلوک‌های کامل متناظر با standard_records')
@@ -80,7 +91,7 @@ def training_status(run_id: UUID, database: DB):
     return row
 
 
-@router.post('/predict', summary='پیش‌بینی اینلاین یک بلوک خام بدون Label؛ حداکثر ۱۰۰۰۰ رکورد')
+@router.post('/predict', summary='پیش‌بینی اینلاین رکورد استاندارد یا خام بدون Label؛ حداکثر ۱۰۰۰۰ رکورد')
 def predict(body: PredictRequest, request: Request):
     started = perf_counter()
     predictor = active(request, body.model_version)
@@ -89,7 +100,7 @@ def predict(body: PredictRequest, request: Request):
         if any(not isinstance(value, str) or not value for value in ids) or len(set(ids)) != len(ids):
             raise HTTPException(422, 'Persistence requires distinct nonempty string original_id or _id values')
     try:
-        response = predictor.predict(records=body.records, raw=True)
+        response = predictor.predict(records=body.records, raw=body.input_format == 'raw')
     except (ValueError, TypeError, OverflowError) as exc:
         raise HTTPException(422, str(exc)) from exc
     write_start = perf_counter()

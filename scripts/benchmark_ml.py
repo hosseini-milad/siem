@@ -71,9 +71,9 @@ def main():
                 return result
             return call
         operations['raw_http_no_persistence'] = http_call('predict', {
-            'model_version': predictor.version, 'records': raw})
+            'model_version': predictor.version, 'records': raw, 'input_format': 'raw'})
         operations['raw_http_with_mongodb_write'] = http_call('predict', {
-            'model_version': predictor.version, 'records': raw, 'persist': True})
+            'model_version': predictor.version, 'records': raw, 'persist': True, 'input_format': 'raw'})
         operations['matrix_http'] = http_call('predict-matrix', {
             'model_version': predictor.version, 'matrix': matrix.tolist()})
     for name, operation in operations.items():

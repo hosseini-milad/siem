@@ -1,4 +1,4 @@
-"""CPU LightGBM with train-only preprocessing and immutable inference snapshots."""
+"""CPU LightGBM over stored standard features with diagnostic model acceptance."""
 from datetime import datetime, timezone
 from decimal import Decimal
 from ipaddress import ip_address
@@ -148,6 +148,8 @@ class Predictor:
         if records is not None:
             ids = [row.get('original_id', row.get('_id')) for row in records]
             if raw:
+                if not self.artifact.get('normalization_schema') or not self.artifact.get('behavior_bounds'):
+                    raise ValueError('Raw preprocessing snapshot is unavailable; send standard records or a prepared matrix')
                 matrix, _ = prepare_raw(records, self.artifact['normalization_schema'],
                                          self.artifact['behavior_bounds'], feature_order=self.names)
             else:
@@ -185,6 +187,13 @@ class ModelManager:
         predictor = self.active  # Each request retains its snapshot during a model swap.
         if predictor is None:
             raise LookupError('No trained model is active')
+        metrics = predictor.artifact.get('test_metrics', {})
+        matrix = metrics.get('confusion_matrix')
+        rejected = predictor.artifact.get('acceptance', {}).get('accepted') is False
+        if matrix is not None and sum(map(sum, matrix)) > 0:
+            rejected = rejected or (matrix[0][0] + matrix[1][0] == 0 or matrix[0][1] + matrix[1][1] == 0)
+        if rejected or metrics.get('roc_auc', 1) <= 0.5:
+            raise LookupError('Active model failed discrimination checks; retrain before predicting')
         if version is not None and version != predictor.version:
             raise ValueError('model_version does not match the active model; refresh the schema')
         return predictor
@@ -199,17 +208,6 @@ class ModelManager:
         finally:
             temporary.unlink(missing_ok=True)
         self.active = predictor
-
-
-def original_rows(db, references, projection=None):
-    originals = {}
-    for offset in range(0, len(references), 500):
-        ids = [item['original_id'] for item in references[offset:offset + 500]]
-        originals.update((item['_id'], item) for item in db.dataset_records.find(
-            {'_id': {'$in': ids}}, projection))
-    if any(item['original_id'] not in originals for item in references):
-        raise ValueError('A training record has no original dataset_records document')
-    return [originals[item['original_id']] for item in references]
 
 
 def coverage_requirements(counts, budget):
@@ -248,8 +246,9 @@ def training_blocks(db, max_records, diagnostics=None, progress=None):
         references.append(row)
         if len(references) != BLOCK_SIZE:
             continue
-        # Legacy standard_records may not have copied labels; resolve them without loading all features.
-        labelled = references if all('Label' in item for item in references) else original_rows(db, references, {'Label': 1})
+        if any('Label' not in item for item in references):
+            raise ValueError('standard_records must contain Label; rerun standardization before training')
+        labelled = references
         kind = block_kind(label_value(item) for item in labelled)
         candidate = {'index': scanned, 'first': references[0]['_id'], 'last': references[-1]['_id']}
         counts[kind] += 1
@@ -287,10 +286,10 @@ def training_blocks(db, max_records, diagnostics=None, progress=None):
     for candidate in selected:
         references = list(db.standard_records.find(
             {'_id': {'$gte': candidate['first'], '$lte': candidate['last']}},
-            {'original_id': 1}).sort('_id', 1))
+            ).sort('_id', 1))
         if len(references) != BLOCK_SIZE:
             raise ValueError('Training membership changed while sampling; keep the dataset unchanged and retry')
-        yield original_rows(db, references)
+        yield references
 
 
 def split_blocks(blocks):
@@ -322,29 +321,47 @@ def split_blocks(blocks):
     return [[blocks[index] for index in group] for group in indices], indices
 
 
-def train(blocks, threads, threshold=0.5, rounds=150):
+def train(blocks, threads, threshold=0.5, rounds=150, input_format='raw', preprocessing=None):
     partitions, partition_indices = split_blocks(blocks)
     labels = [np.asarray([label_value(row) for block in part for row in block], dtype=np.int32)
               for part in partitions]
-    _, schema = fit_rows(row for block in partitions[0] for row in block)
-    prepared = []
-    bounds = {}
-    for block in partitions[0]:
-        records, behavior = prepare_raw(block, schema)
-        prepared.append(records)
-        for feature in behavior:
-            for name, value in feature.items():
-                stat = bounds.setdefault(name, {'min': value, 'max': value})
-                stat['min'], stat['max'] = min(stat['min'], value), max(stat['max'], value)
-    # Reapply train-only behavioral scaling, leaving already-normalized original features intact.
-    for records in prepared:
-        for record in records:
-            record.update(scale_features({name: record[name] for name in bounds}, bounds))
-    names = sorted(prepared[0][0])
-    matrices = [np.concatenate([feature_matrix(records, names) for records in prepared])]
-    for part in partitions[1:]:
-        matrices.append(np.concatenate([feature_matrix(prepare_raw(block, schema, bounds)[0], names)
-                                        for block in part]))
+    if input_format == 'standard':
+        excluded = {'_id', 'original_id', 'Label', 'block_index'}
+        names = sorted(set(partitions[0][0][0]) - excluded)
+        required_behavior = set(block_features([{}])[0])
+        if not required_behavior <= set(names):
+            raise ValueError('standard_records is missing behavioral features; rerun standardization')
+        matrices = []
+        for part in partitions:
+            chunks = []
+            for block in part:
+                if any(type(row.get('Label')) not in (int, float) or row['Label'] not in (0, 1) for row in block):
+                    raise ValueError('standard_records.Label must be numeric 0 or 1')
+                chunks.append(feature_matrix([{key: value for key, value in row.items() if key not in excluded}
+                                              for row in block], names))
+            matrices.append(np.concatenate(chunks))
+        schema = (preprocessing or {}).get('normalization_schema')
+        bounds = (preprocessing or {}).get('behavior_bounds')
+    else:
+        _, schema = fit_rows(row for block in partitions[0] for row in block)
+        prepared = []
+        bounds = {}
+        for block in partitions[0]:
+            records, behavior = prepare_raw(block, schema)
+            prepared.append(records)
+            for feature in behavior:
+                for name, value in feature.items():
+                    stat = bounds.setdefault(name, {'min': value, 'max': value})
+                    stat['min'], stat['max'] = min(stat['min'], value), max(stat['max'], value)
+        # Reapply train-only behavioral scaling, leaving already-normalized original features intact.
+        for records in prepared:
+            for record in records:
+                record.update(scale_features({name: record[name] for name in bounds}, bounds))
+        names = sorted(prepared[0][0])
+        matrices = [np.concatenate([feature_matrix(records, names) for records in prepared])]
+        for part in partitions[1:]:
+            matrices.append(np.concatenate([feature_matrix(prepare_raw(block, schema, bounds)[0], names)
+                                            for block in part]))
     booster = lgb.train({'objective': 'binary', 'verbosity': -1, 'num_threads': threads,
                          'num_leaves': 31, 'max_depth': 6, 'learning_rate': 0.05,
                          'min_data_in_leaf': 40, 'seed': 42, 'deterministic': True,
@@ -356,6 +373,9 @@ def train(blocks, threads, threshold=0.5, rounds=150):
     calibration = LogisticRegression(random_state=42).fit(margins.reshape(-1, 1), labels[1])
     artifact = {'model_version': uuid4().hex, 'format_version': 1, 'algorithm': 'LightGBM',
                 'created_at': datetime.now(timezone.utc).isoformat(), 'features': names,
+                'input_format': input_format,
+                'preprocessing_provenance': ('existing standard_records; preprocessing may have been fitted globally'
+                                             if input_format == 'standard' else 'raw; train-only fit'),
                 'normalization_schema': schema, 'behavior_bounds': bounds,
                 'threshold': threshold, 'booster': booster.model_to_string(),
                 'calibration': {'method': 'Platt', 'coefficient': float(calibration.coef_[0, 0]),
@@ -377,7 +397,42 @@ def train(blocks, threads, threshold=0.5, rounds=150):
         'average_precision': float(average_precision_score(labels[2], probabilities)),
         'brier_score': float(brier_score_loss(labels[2], probabilities)),
         'confusion_matrix': confusion_matrix(labels[2], predictions, labels=[0, 1]).tolist()}
+    artifact['diagnostics'] = {
+        'feature_count': len(names),
+        'train_constant_features': [name for name, constant in zip(names, np.ptp(matrices[0], axis=0) == 0) if constant],
+        'calibration': score_diagnostics(booster, matrices[1], labels[1], artifact, threads),
+        'test': score_diagnostics(booster, matrices[2], labels[2], artifact, threads),
+        'trained_trees': booster.num_trees()}
+    artifact['acceptance'] = acceptance(artifact)
     return artifact
+
+
+def score_diagnostics(booster, matrix, labels, artifact, threads):
+    margins = booster.predict(matrix, raw_score=True, num_threads=threads)
+    probabilities = expit(artifact['calibration']['coefficient'] * margins + artifact['calibration']['intercept'])
+    return {'raw_auc': float(roc_auc_score(labels, margins)),
+            'raw_margin_std': float(np.std(margins)),
+            'raw_probability_min': float(expit(margins).min()),
+            'raw_probability_max': float(expit(margins).max()),
+            'calibrated_auc': float(roc_auc_score(labels, probabilities)),
+            'probability_min': float(probabilities.min()), 'probability_max': float(probabilities.max()),
+            'predicted_attack': int((probabilities >= artifact['threshold']).sum()),
+            'predicted_benign': int((probabilities < artifact['threshold']).sum())}
+
+
+def acceptance(artifact):
+    reasons = []
+    for part, values in artifact['diagnostics'].items():
+        if part not in {'calibration', 'test'}:
+            continue
+        if values['raw_auc'] <= 0.5 or values['calibrated_auc'] <= 0.5:
+            reasons.append(f'{part}: no better-than-chance discrimination')
+        if values['probability_max'] - values['probability_min'] <= 1e-6:
+            reasons.append(f'{part}: constant or nearly constant probabilities')
+        if values['predicted_attack'] == 0 or values['predicted_benign'] == 0:
+            reasons.append(f'{part}: all records predicted as one class at the configured threshold')
+    return {'accepted': not reasons, 'reasons': reasons,
+            'policy': 'reject degenerate candidates; not a production accuracy guarantee'}
 
 
 def training_job(db, manager, job_id, max_records, threshold, rounds):
@@ -389,12 +444,27 @@ def training_job(db, manager, job_id, max_records, threshold, rounds):
                 'sampling': details, 'heartbeat_at': datetime.now(timezone.utc)}})
         blocks = list(training_blocks(db, max_records, sampling, progress))
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {'phase': 'train', 'blocks': len(blocks)}})
-        artifact = train(blocks, manager.threads, threshold, rounds)
+        normalization = db.normalization_parameters.find_one({'_id': 'default'})
+        standardization = db.standardization_parameters.find_one({'_id': 'default'})
+        preprocessing = {'normalization_schema': normalization['schema'] if normalization else None,
+                         'behavior_bounds': {name: value for name, value in standardization['bounds'].items()
+                                             if name != 'block_index'} if standardization else None}
+        artifact = train(blocks, manager.threads, threshold, rounds,
+                         input_format='standard', preprocessing=preprocessing)
         artifact['sampling'] = sampling
+        if not artifact['acceptance']['accepted']:
+            db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
+                'status': 'rejected', 'phase': 'quality_gate', 'metrics': artifact['test_metrics'],
+                'split': artifact['split'], 'diagnostics': artifact['diagnostics'],
+                'acceptance': artifact['acceptance'], 'calibration': artifact['calibration'],
+                'finished_at': datetime.now(timezone.utc)}})
+            return
         manager.publish(artifact)
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
             'status': 'completed', 'phase': 'done', 'model_version': artifact['model_version'],
             'metrics': artifact['test_metrics'], 'split': artifact['split'],
+            'diagnostics': artifact['diagnostics'], 'acceptance': artifact['acceptance'],
+            'calibration': artifact['calibration'], 'input_format': 'standard',
             'finished_at': datetime.now(timezone.utc)}})
     except Exception as exc:
         logger.exception('ML training %s failed', job_id)

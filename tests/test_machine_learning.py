@@ -8,6 +8,8 @@ from pymongo import MongoClient
 
 from app.core.config import Settings
 from app.main import create_app
+from app.services.standardization import block_features
+
 from app.services.machine_learning import (ModelManager, Predictor, feature_matrix, prepare_raw,
                                             train, training_job, validate_matrix, split_blocks, training_blocks)
 
@@ -101,7 +103,7 @@ def test_inline_api_persistence_validation_and_model_schema(setup, trained):
     metadata = client.get('/api/v1/ml/model').json()
     assert metadata['features'] == artifact['features'] and 'booster' not in metadata
     raw = [{key: value for key, value in row.items() if key != 'Label'} for row in blocks[4]]
-    body = {'model_version': artifact['model_version'], 'records': raw, 'persist': True}
+    body = {'model_version': artifact['model_version'], 'records': raw, 'persist': True, 'input_format': 'raw'}
     result = client.post('/api/v1/ml/predict', json=body)
     assert result.status_code == 200, result.text
     assert len(result.json()['items']) == 10000
@@ -126,7 +128,7 @@ def test_database_training_and_restart(setup, trained):
     _, blocks = trained
     originals = [row for block in blocks for row in block]
     db.dataset_records.insert_many(originals)
-    db.standard_records.insert_many([{'_id': row['_id'], 'original_id': row['_id']} for row in originals])
+    db.standard_records.insert_many([standard_row(row['_id'], int(row['Label'] == 'attack')) for row in originals])
     result = client.post('/api/v1/ml/training/runs', json={'max_records': 50000, 'rounds': 10})
     assert result.status_code == 202
     status = client.get('/api/v1/ml/training/runs/' + result.json()['id']).json()
@@ -224,8 +226,7 @@ def test_sampling_reaches_late_class_beyond_record_cap(setup):
     originals = [{'_id': f'{b:02}-{i:05}', 'Label': 'benign' if b < 6 else 'attack',
                   'signal': '0' if b < 6 else '1'} for b in range(9) for i in range(10000)]
     db.dataset_records.insert_many(originals)
-    db.standard_records.insert_many([{'_id': row['_id'], 'original_id': row['_id'],
-                                      'Label': 0 if row['Label'] == 'benign' else 1} for row in originals])
+    db.standard_records.insert_many([standard_row(row['_id'], int(row['Label'] == 'attack')) for row in originals])
     diagnostics = {}
     chosen = list(training_blocks(db, 60000, diagnostics))
     assert len(chosen) == 6 and all(len(block) == 10000 for block in chosen)
@@ -248,3 +249,81 @@ def test_sampling_reaches_late_class_beyond_record_cap(setup):
     assert failed['status'] == 'failed' and '60000' in failed['error']
     assert failed['sampling']['block_classes']['attack'] == 3
     assert client.get('/api/v1/ml/model').json()['model_version'] == metadata['model_version']
+
+
+def standard_row(key, label, informative=True):
+    behavior = {name: 0.0 for name in block_features([{}])[0]}
+    behavior['source_record_share'] = float(label) if informative else 0.0
+    return {'_id': key, 'original_id': key, 'Label': label, 'constant_original': 0.0,
+            'block_index': 0.0, **behavior}
+
+
+def test_standard_training_uses_stored_behavior_and_never_reads_raw(setup, monkeypatch):
+    from pymongo.collection import Collection
+    client, db, _ = setup
+    db.standard_records.insert_many([standard_row(f'{b}-{i:05}', i % 2)
+                                     for b in range(5) for i in range(10000)])
+    original_find = Collection.find
+    def no_raw(collection, *args, **kwargs):
+        if collection.name == 'dataset_records':
+            pytest.fail('Training must use standard_records without reconstructing raw features')
+        return original_find(collection, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(Collection, 'find', no_raw)
+        patch.setattr('app.services.machine_learning.fit_rows',
+                      lambda *args, **kwargs: pytest.fail('Standard features must not be refitted'))
+        patch.setattr('app.services.machine_learning.prepare_raw',
+                      lambda *args, **kwargs: pytest.fail('Stored behavior must not be recomputed'))
+        response = client.post('/api/v1/ml/training/runs', json={'max_records': 50000, 'rounds': 10})
+    result = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
+    assert result['status'] == 'completed', result
+    assert result['acceptance']['accepted']
+    model = client.get('/api/v1/ml/model').json()
+    assert model['input_format'] == 'standard'
+    assert model['feature_importance_gain']['source_record_share'] > 0
+    assert model['feature_importance_gain']['constant_original'] == 0
+    assert set(block_features([{}])[0]) <= set(model['features'])
+    assert 'block_index' not in model['features']
+    for label in (0, 1):
+        record = standard_row('new', label)
+        record.pop('Label')
+        prediction = client.post('/api/v1/ml/predict', json={
+            'model_version': model['model_version'], 'records': [record]})
+        assert prediction.status_code == 200, prediction.text
+        assert prediction.json()['items'][0]['predicted_label'] == label
+        assert prediction.json()['items'][0]['original_id'] == 'new'
+    response = client.post('/api/v1/ml/predict', json={
+        'model_version': model['model_version'], 'records': [{'n': '1'}], 'input_format': 'raw'})
+    assert response.status_code == 422
+
+
+def test_constant_model_is_rejected_and_prior_model_preserved(setup, trained):
+    client, db, _ = setup
+    prior, _ = trained
+    client.app.state.ml.publish(prior)
+    db.standard_records.insert_many([standard_row(f'{b}-{i:05}', i % 2, informative=False)
+                                     for b in range(5) for i in range(10000)])
+    response = client.post('/api/v1/ml/training/runs', json={'max_records': 50000, 'rounds': 10})
+    result = client.get('/api/v1/ml/training/runs/' + response.json()['id']).json()
+    assert result['status'] == 'rejected', result
+    assert not result['acceptance']['accepted']
+    assert result['diagnostics']['test']['raw_auc'] == 0.5
+    assert result['diagnostics']['test']['probability_min'] == pytest.approx(0.5)
+    assert result['diagnostics']['test']['probability_max'] == pytest.approx(0.5)
+    assert result['diagnostics']['test']['predicted_benign'] == 0
+    assert client.app.state.ml.require().version == prior['model_version']
+    assert not client.app.state.import_lock.locked()
+
+
+def test_legacy_degenerate_active_model_is_not_served(setup, trained):
+    client, _, _ = setup
+    artifact, _ = trained
+    bad = {**artifact, 'test_metrics': {'roc_auc': 0.5, 'confusion_matrix': [[0, 11069], [0, 8931]]}}
+    client.app.state.ml.publish(bad)
+    response = client.post('/api/v1/ml/predict-matrix', json={
+        'model_version': bad['model_version'], 'matrix': [[0] * len(bad['features'])]})
+    assert response.status_code == 503
+    assert 'retrain' in response.json()['detail']
+    metadata = client.get('/api/v1/ml/model').json()
+    assert metadata['serving_eligible'] is False
+    assert metadata['test_metrics']['roc_auc'] == 0.5
