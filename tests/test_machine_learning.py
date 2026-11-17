@@ -43,9 +43,15 @@ def setup(tmp_path):
 
 def test_train_only_scaling_calibration_and_quality(trained):
     artifact, blocks = trained
-    assert artifact['split']['train_rows'] == 20000
-    assert artifact['split']['validation_rows'] == 10000
-    assert artifact['split']['calibration_rows'] == artifact['split']['test_rows'] == 10000
+    for name, counts in artifact['split']['class_counts'].items():
+        assert counts['benign'] * 2 == counts['attack'] * 3
+        assert artifact['split'][name + '_rows'] == sum(counts.values())
+        assert artifact['split']['source_class_counts'][name]['benign'] >= counts['benign']
+        assert artifact['split']['source_class_counts'][name]['attack'] >= counts['attack']
+    assert artifact['excluded_features'] == ['Timestamp', 'block_duration_seconds']
+    assert not {'Timestamp', 'block_duration_seconds'} & set(artifact['features'])
+    assert not {'Timestamp', 'block_duration_seconds'} & set(artifact['feature_importance_gain'])
+    assert not {'Timestamp', 'block_duration_seconds'} & set(artifact['feature_importance_catboost'])
     timestamp = next(stat for stat in artifact['normalization_schema'] if stat['field'] == 'Timestamp')
     train_indices = artifact['split']['block_indices']['train']
     assert timestamp['max'] == str(max(train_indices) * 10000 + 9999)
@@ -288,7 +294,7 @@ def test_standard_training_uses_stored_behavior_and_never_reads_raw(setup, monke
     assert model['input_format'] == 'standard'
     assert model['feature_importance_gain']['source_record_share'] > 0
     assert model['feature_importance_gain']['constant_original'] == 0
-    assert set(block_features([{}])[0]) <= set(model['features'])
+    assert set(block_features([{}])[0]) - {'block_duration_seconds'} <= set(model['features'])
     assert 'block_index' not in model['features']
     for label in (0, 1):
         record = standard_row('new', label)
@@ -384,3 +390,55 @@ def test_reset_during_prediction_does_not_store_old_results(setup, trained, monk
         'records': blocks[4][:1], 'input_format': 'raw', 'persist': True})
     assert response.status_code == 503
     assert db.ml_predictions.count_documents({}) == 0
+
+
+def test_stratified_rows_are_random_unique_and_reproducible():
+    from app.services.machine_learning import balanced_row_indices
+    labels = np.asarray([0] * 900 + [1] * 400)
+    before = labels.copy()
+    selected = balanced_row_indices(labels, 42)
+    assert len(selected) == len(set(selected)) == 1000
+    assert int((labels[selected] == 0).sum()) == 600
+    assert int((labels[selected] == 1).sum()) == 400
+    assert selected.min() >= 0 and selected.max() < len(labels)
+    assert np.array_equal(labels, before)
+    assert np.array_equal(selected, balanced_row_indices(labels, 42))
+    assert not np.array_equal(selected, balanced_row_indices(labels, 43))
+    assert not np.array_equal(selected, np.sort(selected))
+    assert max(selected[labels[selected] == 0]) > 600
+    with pytest.raises(ValueError, match='60/40'):
+        balanced_row_indices(np.asarray([0, 0, 1]), 42)
+
+
+def test_mixed_block_is_not_systematically_reserved_for_test():
+    blocks = [[{'Label': 'benign'}, {'Label': 'attack'}]]
+    blocks += [[{'Label': name}] for name in ('benign', 'attack') for _ in range(8)]
+    seen = set()
+    for seed in range(12):
+        _, indices = split_blocks(blocks, random_seed=seed)
+        assert sorted(index for group in indices for index in group) == list(range(len(blocks)))
+        seen.add(next(part for part, group in enumerate(indices) if 0 in group))
+        assert indices == split_blocks(blocks, random_seed=seed)[1]
+    assert len(seen) > 1
+
+
+def test_excluded_time_values_cannot_affect_standard_prediction(setup, trained):
+    client, db, _ = setup
+    artifact, blocks = trained
+    client.app.state.ml.publish(artifact)
+    prepared, _ = prepare_raw(blocks[0], artifact['normalization_schema'], artifact['behavior_bounds'])
+    records = [{**prepared[i], 'original_id': str(i), 'Timestamp': 0, 'block_duration_seconds': 0}
+               for i in range(2)]
+    first = client.post('/api/v1/ml/predict', json={'records': records})
+    assert first.status_code == 200, first.text
+    for row in records:
+        row['Timestamp'] = 1
+        row['block_duration_seconds'] = 1
+    second = client.post('/api/v1/ml/predict', json={'records': records})
+    assert second.status_code == 200
+    assert first.json()['items'] == second.json()['items']
+    for row in records:
+        row.pop('Timestamp')
+        row.pop('block_duration_seconds')
+    assert client.post('/api/v1/ml/predict', json={'records': records}).json()['items'] == first.json()['items']
+    assert client.post('/api/v1/ml/training/runs', json={'random_seed': -1}).status_code == 422

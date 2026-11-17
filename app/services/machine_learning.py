@@ -23,6 +23,10 @@ from sklearn.metrics import (average_precision_score, brier_score_loss, confusio
 from app.services.normalization import EXCLUDED, fit_rows, label_value, transform, value_text, MISSING
 from app.services.standardization import BLOCK_SIZE, BOUNDED_FEATURES, block_features, scale_features
 
+EXCLUDED_MODEL_FEATURES = {'Timestamp', 'block_duration_seconds'}
+NON_FEATURE_FIELDS = {'_id', 'original_id', 'Label', 'block_index'}
+TARGET_ATTACK_FRACTION = 0.4
+
 logger = logging.getLogger('uvicorn.error.siem.ml')
 
 
@@ -119,6 +123,8 @@ def prepare_raw(rows, schema, bounds=None, feature_order=None):
                 scaled[:, index] = behavior_matrix[:, index]
         behavior_matrix = np.clip(scaled, 0, 1)
     columns.update((name, behavior_matrix[:, index]) for index, name in enumerate(behavior_names))
+    for name in EXCLUDED_MODEL_FEATURES:
+        columns.pop(name, None)
     names = list(columns) if feature_order is None else feature_order
     if set(names) != set(columns):
         raise ValueError('Feature columns must exactly match the active model schema')
@@ -166,7 +172,7 @@ class Predictor:
                                          self.artifact['behavior_bounds'], feature_order=self.names)
             else:
                 records = [{key: value for key, value in row.items()
-                            if key not in {'_id', 'original_id', 'Label', 'block_index'}} for row in records]
+                            if key not in NON_FEATURE_FIELDS | EXCLUDED_MODEL_FEATURES} for row in records]
             if not raw:
                 matrix = feature_matrix(records, self.names)
         else:
@@ -202,6 +208,8 @@ class ModelManager:
         predictor = self.active  # Each request retains its snapshot during a model swap.
         if predictor is None:
             raise LookupError('No trained model is active')
+        if set(predictor.names) & EXCLUDED_MODEL_FEATURES:
+            raise LookupError('Active model uses excluded time features; retrain before predicting')
         metrics = predictor.artifact.get('test_metrics', {})
         matrix = metrics.get('confusion_matrix')
         rejected = predictor.artifact.get('acceptance', {}).get('accepted') is False
@@ -252,16 +260,17 @@ def block_kind(labels):
     return 'mixed' if classes == {0, 1} else ('attack' if classes == {1} else 'benign')
 
 
-def training_blocks(db, max_records, diagnostics=None, progress=None):
+def training_blocks(db, max_records, diagnostics=None, progress=None, random_seed=42):
     """Scan all block labels; bound retained raw rows, not the scan's prefix."""
     diagnostics = diagnostics if diagnostics is not None else {}
     budget = max_records // BLOCK_SIZE
-    rng = random.Random(42)
+    rng = random.Random(random_seed)
     counts = dict.fromkeys(('benign', 'attack', 'mixed'), 0)
     reservoirs = {name: [] for name in counts}
     references = []
     scanned = 0
     reported = perf_counter()
+    mixed_attack_rows = 0
     for row in db.standard_records.find({}, {'original_id': 1, 'Label': 1}).sort('_id', 1).batch_size(500):
         references.append(row)
         if len(references) != BLOCK_SIZE:
@@ -269,9 +278,13 @@ def training_blocks(db, max_records, diagnostics=None, progress=None):
         if any('Label' not in item for item in references):
             raise ValueError('standard_records must contain Label; rerun standardization before training')
         labelled = references
-        kind = block_kind(label_value(item) for item in labelled)
-        candidate = {'index': scanned, 'first': references[0]['_id'], 'last': references[-1]['_id']}
+        attack_rows = sum(label_value(item) for item in labelled)
+        kind = 'mixed' if 0 < attack_rows < BLOCK_SIZE else ('attack' if attack_rows else 'benign')
+        candidate = {'index': scanned, 'first': references[0]['_id'], 'last': references[-1]['_id'],
+                     'attack_rows': attack_rows}
         counts[kind] += 1
+        if kind == 'mixed':
+            mixed_attack_rows += attack_rows
         if len(reservoirs[kind]) < budget:
             reservoirs[kind].append(candidate)
         else:
@@ -280,7 +293,7 @@ def training_blocks(db, max_records, diagnostics=None, progress=None):
                 reservoirs[kind][slot] = candidate
         scanned += 1
         references = []
-        diagnostics.update({'complete_blocks_scanned': scanned, 'block_classes': dict(counts), 'seed': 42})
+        diagnostics.update({'complete_blocks_scanned': scanned, 'block_classes': dict(counts), 'seed': random_seed})
         if progress and (scanned == 1 or perf_counter() - reported >= 5):
             progress(dict(diagnostics))
             reported = perf_counter()
@@ -291,16 +304,25 @@ def training_blocks(db, max_records, diagnostics=None, progress=None):
         raise ValueError(f'At least five complete 10000-record blocks (50000 records) are required; found {scanned}')
     quota = coverage_requirements(counts, budget)
     total = min(budget, scanned)
+    mixed_target = min(counts['mixed'], max(quota['mixed'], round(total * counts['mixed'] / scanned)))
+    mixed_attack_fraction = mixed_attack_rows / (counts['mixed'] * BLOCK_SIZE) if counts['mixed'] else 0
+    attack_target = max(0, total * TARGET_ATTACK_FRACTION - mixed_target * mixed_attack_fraction)
+    desired = {'mixed': mixed_target, 'attack': attack_target,
+               'benign': max(0, total - mixed_target - attack_target)}
     while sum(quota.values()) < total:
         available = [name for name in counts if quota[name] < counts[name]]
-        name = max(available, key=lambda name: counts[name] * total / scanned - quota[name])
+        name = max(available, key=lambda name: desired[name] - quota[name])
         quota[name] += 1
     selected = []
     for name in counts:
         rng.shuffle(reservoirs[name])
         selected.extend(reservoirs[name][:quota[name]])
     selected.sort(key=lambda candidate: candidate['index'])
-    diagnostics.update({'selected_block_classes': quota, 'selected_source_block_indices': [item['index'] for item in selected]})
+    diagnostics.update({'selected_block_classes': quota, 'selected_source_block_indices': [item['index'] for item in selected],
+                        'target_class_fraction': {'benign': 0.6, 'attack': TARGET_ATTACK_FRACTION},
+                        'selected_source_class_counts': {
+                            'attack': sum(item['attack_rows'] for item in selected),
+                            'benign': len(selected) * BLOCK_SIZE - sum(item['attack_rows'] for item in selected)}})
     if progress:
         progress(dict(diagnostics))
     for candidate in selected:
@@ -312,19 +334,23 @@ def training_blocks(db, max_records, diagnostics=None, progress=None):
         yield references
 
 
-def split_blocks(blocks):
+def split_blocks(blocks, random_seed=42):
     if len(blocks) < 5:
         raise ValueError('At least five complete 10000-record blocks (50000 records) are required')
     groups = {'benign': [], 'attack': [], 'mixed': []}
+    class_counts = []
     for index, block in enumerate(blocks):
+        attacks = sum(label_value(row) for row in block)
+        class_counts.append((len(block) - attacks, attacks))
         groups[block_kind(label_value(row) for row in block)].append(index)
     coverage_requirements({name: len(indices) for name, indices in groups.items()}, len(blocks))
-    rng = random.Random(42)
-    for indices in groups.values():
-        rng.shuffle(indices)
+    rng = random.Random(random_seed)
+    for group in groups.values():
+        rng.shuffle(group)
     indices = [[], [], [], []]
-    # Seed small holdouts with mixed blocks first; pure blocks require a pair per split.
-    for partition in (3, 2, 1, 0):
+    partition_order = list(range(4))
+    rng.shuffle(partition_order)  # A rare mixed block is not always reserved for test.
+    for partition in partition_order:
         if groups['mixed']:
             indices[partition].append(groups['mixed'].pop())
         else:
@@ -334,24 +360,48 @@ def split_blocks(blocks):
     while sum(targets) < len(blocks):
         part = max(range(4), key=lambda index: desired[index] - targets[index])
         targets[part] += 1
+    totals = [[sum(class_counts[index][label] for index in part) for label in (0, 1)] for part in indices]
     remaining = [index for group in groups.values() for index in group]
     rng.shuffle(remaining)
     for index in remaining:
-        partition = max(range(4), key=lambda part: targets[part] - len(indices[part]))
+        available = [part for part in range(4) if len(indices[part]) < targets[part]] or list(range(4))
+        benign, attack = class_counts[index]
+        def gain(part):
+            target_rows = targets[part] * len(blocks[index])
+            wanted = (target_rows * 0.6, target_rows * TARGET_ATTACK_FRACTION)
+            return sum((wanted[label] - totals[part][label]) * value
+                       for label, value in enumerate((benign, attack))) / max(target_rows, 1)
+        partition = max(available, key=gain)
         indices[partition].append(index)
+        totals[partition][0] += benign
+        totals[partition][1] += attack
     for group in indices:
-        group.sort()
+        rng.shuffle(group)
     return [[blocks[index] for index in group] for group in indices], indices
 
 
-def train(blocks, threads, threshold=0.5, rounds=500, input_format='raw', preprocessing=None):
-    partitions, partition_indices = split_blocks(blocks)
+def balanced_row_indices(labels, random_seed):
+    """Random undersampling with no duplication: exactly three benign for two attack rows."""
+    rng = np.random.default_rng(random_seed)
+    benign = np.flatnonzero(labels == 0)
+    attack = np.flatnonzero(labels == 1)
+    units = min(len(benign) // 3, len(attack) // 2)
+    if not units:
+        raise ValueError('Each partition needs at least 3 benign and 2 attack records for a 60/40 sample')
+    selected = np.concatenate([rng.choice(benign, units * 3, replace=False),
+                               rng.choice(attack, units * 2, replace=False)])
+    rng.shuffle(selected)
+    return selected
+
+
+def train(blocks, threads, threshold=0.5, rounds=500, input_format='raw', preprocessing=None, random_seed=42):
+    partitions, partition_indices = split_blocks(blocks, random_seed)
     labels = [np.asarray([label_value(row) for block in part for row in block], dtype=np.int32)
               for part in partitions]
     if input_format == 'standard':
-        excluded = {'_id', 'original_id', 'Label', 'block_index'}
+        excluded = NON_FEATURE_FIELDS | EXCLUDED_MODEL_FEATURES
         names = sorted(set(partitions[0][0][0]) - excluded)
-        required_behavior = set(block_features([{}])[0])
+        required_behavior = set(block_features([{}])[0]) - EXCLUDED_MODEL_FEATURES
         if not required_behavior <= set(names):
             raise ValueError('standard_records is missing behavioral features; rerun standardization')
         matrices = []
@@ -379,12 +429,19 @@ def train(blocks, threads, threshold=0.5, rounds=500, input_format='raw', prepro
         # Reapply train-only behavioral scaling, leaving already-normalized original features intact.
         for records in prepared:
             for record in records:
-                record.update(scale_features({name: record[name] for name in bounds}, bounds))
+                retained = {name: value for name, value in bounds.items() if name not in EXCLUDED_MODEL_FEATURES}
+                record.update(scale_features({name: record[name] for name in retained}, retained))
         names = sorted(prepared[0][0])
         matrices = [np.concatenate([feature_matrix(records, names) for records in prepared])]
         for part in partitions[1:]:
             matrices.append(np.concatenate([feature_matrix(prepare_raw(block, schema, bounds)[0], names)
                                             for block in part]))
+    source_class_counts = {name: {'benign': int((y == 0).sum()), 'attack': int((y == 1).sum())}
+                           for name, y in zip(('train', 'validation', 'calibration', 'test'), labels)}
+    for part in range(4):
+        selected = balanced_row_indices(labels[part], random_seed + part)
+        matrices[part] = matrices[part][selected]
+        labels[part] = labels[part][selected]
     constant = np.ptp(matrices[0], axis=0) == 0
     if constant.all():
         raise TrainingRejected('All training features are constant; inspect standard_records before retraining',
@@ -394,11 +451,11 @@ def train(blocks, threads, threshold=0.5, rounds=500, input_format='raw', prepro
     validation_data = lgb.Dataset(matrices[1], label=labels[1], feature_name=feature_ids, reference=training_data)
     booster = lgb.train({'objective': 'binary', 'metric': 'auc', 'verbosity': -1, 'num_threads': threads,
                          'num_leaves': 31, 'max_depth': 6, 'learning_rate': 0.05,
-                         'min_data_in_leaf': 40, 'seed': 42, 'deterministic': True, 'force_col_wise': True},
+                         'min_data_in_leaf': 40, 'seed': random_seed, 'deterministic': True, 'force_col_wise': True},
                         training_data, num_boost_round=rounds, valid_sets=[validation_data],
                         callbacks=[lgb.early_stopping(50, verbose=False)])
     cat = CatBoostClassifier(iterations=rounds, depth=6, learning_rate=0.05, loss_function='Logloss',
-                             eval_metric='AUC', thread_count=threads, random_seed=42,
+                             eval_metric='AUC', thread_count=threads, random_seed=random_seed,
                              allow_writing_files=False, verbose=False)
     cat.fit(matrices[0], labels[0], eval_set=(matrices[1], labels[1]),
             early_stopping_rounds=50, use_best_model=True)
@@ -412,7 +469,7 @@ def train(blocks, threads, threshold=0.5, rounds=500, input_format='raw', prepro
     split_names = ('train', 'validation', 'calibration', 'test')
     artifact = {'algorithm': 'LightGBM + CatBoost',
                 'created_at': datetime.now(timezone.utc).isoformat(), 'features': names,
-                'input_format': input_format,
+                'input_format': input_format, 'excluded_features': sorted(EXCLUDED_MODEL_FEATURES),
                 'preprocessing_provenance': ('existing standard_records; preprocessing may have been fitted globally'
                                              if input_format == 'standard' else 'raw; train-only fit'),
                 'normalization_schema': schema, 'behavior_bounds': bounds,
@@ -422,8 +479,16 @@ def train(blocks, threads, threshold=0.5, rounds=500, input_format='raw', prepro
                              'selection_metric': 'validation_log_loss', 'validation_scores': selection_scores},
                 'feature_importance_gain': dict(zip(names, booster.feature_importance('gain').tolist())),
                 'feature_importance_catboost': dict(zip(names, cat.get_feature_importance().tolist())),
-                'split': {'order': 'deterministic class-covered whole-block split; not chronological',
-                          'seed': 42, 'block_indices': dict(zip(split_names, partition_indices)),
+                'split': {'order': 'random disjoint blocks, then stratified random rows without replacement; not chronological',
+                          'seed': random_seed,
+                          'target_class_fraction': {'benign': 0.6, 'attack': TARGET_ATTACK_FRACTION},
+                          'source_class_counts': source_class_counts,
+                          'discarded_for_balance': {name: sum(source_class_counts[name].values()) - len(y)
+                                                    for name, y in zip(split_names, labels)},
+                          'class_fraction': {name: {'benign': float((y == 0).mean()),
+                                                   'attack': float((y == 1).mean())}
+                                             for name, y in zip(split_names, labels)},
+                          'row_sampling': '60/40 undersampling within each partition; behavioral context preserved', 'block_indices': dict(zip(split_names, partition_indices)),
                           'class_counts': {name: {'benign': int((y == 0).sum()), 'attack': int((y == 1).sum())}
                                            for name, y in zip(split_names, labels)},
                           **{name + '_rows': len(y) for name, y in zip(split_names, labels)}}}
@@ -508,14 +573,14 @@ def acceptance(artifact):
             'policy': 'reject degenerate candidates; not a production accuracy guarantee'}
 
 
-def training_job(db, manager, job_id, max_records, threshold, rounds):
+def training_job(db, manager, job_id, max_records, threshold, rounds, random_seed=42):
     sampling = {}
     try:
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {'phase': 'read'}})
         def progress(details):
             db.ml_training_runs.update_one({'_id': job_id}, {'$set': {
                 'sampling': details, 'heartbeat_at': datetime.now(timezone.utc)}})
-        blocks = list(training_blocks(db, max_records, sampling, progress))
+        blocks = list(training_blocks(db, max_records, sampling, progress, random_seed))
         db.ml_training_runs.update_one({'_id': job_id}, {'$set': {'phase': 'train', 'blocks': len(blocks)}})
         normalization = db.normalization_parameters.find_one({'_id': 'default'})
         standardization = db.standardization_parameters.find_one({'_id': 'default'})
@@ -523,7 +588,7 @@ def training_job(db, manager, job_id, max_records, threshold, rounds):
                          'behavior_bounds': {name: value for name, value in standardization['bounds'].items()
                                              if name != 'block_index'} if standardization else None}
         artifact = train(blocks, manager.threads, threshold, rounds,
-                         input_format='standard', preprocessing=preprocessing)
+                         input_format='standard', preprocessing=preprocessing, random_seed=random_seed)
         artifact['sampling'] = sampling
         if not artifact['acceptance']['accepted']:
             db.ml_training_runs.update_one({'_id': job_id}, {'$set': {

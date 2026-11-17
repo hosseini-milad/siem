@@ -20,6 +20,7 @@ class TrainingRequest(BaseModel):
     max_records: int = Field(default=300000, ge=50000, le=1000000, multiple_of=10000)
     threshold: float = Field(default=0.5, gt=0, lt=1)
     rounds: int = Field(default=500, ge=10, le=2000)
+    random_seed: int = Field(default=42, ge=0, le=2147483647)
 
 
 class PredictRequest(BaseModel):
@@ -80,7 +81,7 @@ def start_training(body: TrainingRequest, request: Request, tasks: BackgroundTas
 
     def run():
         try:
-            training_job(database, manager, job_id, body.max_records, body.threshold, body.rounds)
+            training_job(database, manager, job_id, body.max_records, body.threshold, body.rounds, body.random_seed)
         finally:
             request.app.state.import_lock.release()
             manager.training_lock.release()
