@@ -3,6 +3,7 @@ from threading import Lock
 from datetime import datetime, timezone
 import logging
 
+from app.api.standardization import router as standardization_router
 from app.api.datasets import router as datasets_router
 from app.api.normalization import router as normalization_router
 
@@ -38,6 +39,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         'Startup marked %s previous normalization runs interrupted; use one worker and no reload',
                         interrupted.modified_count)
                 app.state.database.dataset_imports.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
+                app.state.database.standardization_runs.update_many(
+                    {"status": "running"}, {"$set": {"status": "interrupted",
+                     "interruption_reason": "Server restarted; rerun standardization to rebuild blocks",
+                     "interrupted_at": datetime.now(timezone.utc)}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index([("timestamp", -1), ("_id", -1)])
                 collection.create_index([("source", 1), ("timestamp", -1)])
@@ -56,6 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(router)
     app.include_router(datasets_router)
     app.include_router(normalization_router)
+    app.include_router(standardization_router)
 
     @app.exception_handler(PyMongoError)
     async def database_error(request: Request, exc: PyMongoError):
