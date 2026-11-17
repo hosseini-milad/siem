@@ -20,4 +20,4 @@ def log_document(event: LogCreate) -> dict[str, Any]:
 
 
 def public_document(document: dict[str, Any]) -> dict[str, Any]:
-    return {"id": document["_id"], **{k: v for k, v in document.items() if k != "_id"}}
+    return {"id": document["_id"], **{k: v for k, v in document.items() if k not in {"_id", "_search_index"}}}

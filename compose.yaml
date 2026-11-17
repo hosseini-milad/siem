@@ -10,5 +10,88 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+  elasticsearch:
+    profiles: [elk]
+    image: elasticsearch:8.17.0@sha256:0681af5779b516b0652df86aa1db52e225f2d4e68bb3a3099534377b7f788739
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - elastic_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+  logstash:
+    profiles: [elk]
+    image: logstash:8.17.0@sha256:8793dd50c1aee8fbbc6993c06c6c0e1a9fc492b30c6a98fe3ed77d166f234ec2
+    environment:
+      LS_JAVA_OPTS: -Xms512m -Xmx512m
+      SIEM_API_URL: ${SIEM_LOGSTASH_TARGET_URL:-http://backend:8000/api/v1/ingestion/logstash}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9600:9600"
+    volumes:
+      - ./deploy/logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./deploy/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - logstash_data:/usr/share/logstash/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/_node/pipelines/main >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+  kibana:
+    profiles: [elk]
+    image: kibana:8.17.0@sha256:a41c1a96bb2511f23cfc54ff9830169c19cc42facd29cf9db2c8e640b8da0dbb
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      XPACK_SECURITY_ENABLED: "false"
+      TELEMETRY_ENABLED: "false"
+      NODE_OPTIONS: --max-old-space-size=1024
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status >/dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 40
+  backend:
+    profiles: [elk]
+    build: .
+    environment:
+      SIEM_MONGODB_URI: ${SIEM_DOCKER_MONGODB_URI:-mongodb://mongodb:27017}
+      SIEM_MONGODB_DATABASE: ${SIEM_MONGODB_DATABASE:-siem}
+      SIEM_ELASTICSEARCH_URL: http://elasticsearch:9200
+      SIEM_LOGSTASH_URL: http://logstash:9600
+      SIEM_LOGSTASH_INPUT_URL: http://logstash:8080
+      SIEM_KIBANA_URL: http://kibana:5601
+      SIEM_ELK_TIMEOUT_SECONDS: "60"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ml_data:/app/data/ml
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
 volumes:
   mongo_data:
+  elastic_data:
+  logstash_data:
+  ml_data:

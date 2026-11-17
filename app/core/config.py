@@ -1,4 +1,4 @@
-from pydantic import Field
+from pydantic import AnyHttpUrl, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,3 +12,9 @@ class Settings(BaseSettings):
     datasets_root: str = "ds/Datasets"
     ml_model_dir: str = "data/ml"
     ml_threads: int = Field(default=2, ge=1, le=32)
+    elasticsearch_url: AnyHttpUrl = 'http://127.0.0.1:9200'
+    elasticsearch_index: str = Field(default='siem-events', pattern=r'^[a-z0-9][a-z0-9_-]{0,127}$')
+    logstash_url: AnyHttpUrl = 'http://127.0.0.1:9600'
+    logstash_input_url: AnyHttpUrl = 'http://127.0.0.1:8080'
+    kibana_url: AnyHttpUrl = 'http://127.0.0.1:5601'
+    elk_timeout_seconds: float = Field(default=10, gt=0, le=120)

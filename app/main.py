@@ -2,6 +2,10 @@ from contextlib import asynccontextmanager
 from threading import Lock
 from datetime import datetime, timezone
 import logging
+import httpx
+
+from app.api.siem import router as siem_router, TAGS
+from app.services.elk import Elk, IntegrationUnavailable
 
 from app.api.machine_learning import router as machine_learning_router
 from app.services.machine_learning import ModelManager
@@ -26,6 +30,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.ml = ModelManager(config.ml_model_dir, config.ml_threads)
+        elk_client = httpx.Client(timeout=config.elk_timeout_seconds, trust_env=False)
+        app.state.elk = Elk(config, elk_client)
         client = MongoClient(config.mongodb_uri, tz_aware=True, serverSelectionTimeoutMS=config.mongodb_server_selection_timeout_ms,
                              connectTimeoutMS=config.mongodb_connect_timeout_ms,
                              socketTimeoutMS=config.mongodb_socket_timeout_ms)
@@ -54,22 +60,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 collection.create_index([("timestamp", -1), ("_id", -1)])
                 collection.create_index([("source", 1), ("timestamp", -1)])
                 collection.create_index([("level", 1), ("timestamp", -1)])
+                collection.create_index([("_search_index", 1), ("received_at", 1), ("_id", 1)])
+                app.state.database.siem_alerts.create_index([("status", 1), ("severity", 1), ("created_at", -1)])
+                app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
+                app.state.database.siem_rules.create_index("enabled")
             await run_in_threadpool(initialize)
             yield
         finally:
+            elk_client.close()
             client.close()
 
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
-                  description="SIEM: دریافت لاگ، ویژگی‌های رفتاری و تشخیص دوکلاسه با LightGBM و CatBoost.",
-                  swagger_ui_parameters={"displayRequestDuration": True},
-                  responses={503: {"description": "MongoDB unavailable; batch writes may be partial"}})
+                  description="SIEM هوشمند: رویدادها، هشدارها، قواعد، رخدادها، ELK و مدل‌های LightGBM/CatBoost. بدون احراز هویت؛ اجنت‌ها خارج از این مرحله‌اند.",
+                  openapi_tags=[{"name": name, "description": description} for name, description in TAGS],
+                  swagger_ui_parameters={"displayRequestDuration": True, "docExpansion": "none"},
+                  responses={503: {"description": "Storage or ELK service unavailable; batch writes may be partial"}})
     app.state.settings = config
     app.state.import_lock = Lock()
+    app.state.search_sync_lock = Lock()
     app.include_router(router)
     app.include_router(datasets_router)
     app.include_router(normalization_router)
     app.include_router(standardization_router)
     app.include_router(machine_learning_router)
+    app.include_router(siem_router)
+
+    @app.exception_handler(IntegrationUnavailable)
+    async def integration_error(request: Request, exc: IntegrationUnavailable):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
 
     @app.exception_handler(PyMongoError)
     async def database_error(request: Request, exc: PyMongoError):

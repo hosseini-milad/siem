@@ -1,0 +1,37 @@
+{
+  "source": "siem-smoke-0b9f5548fc2c",
+  "batch_id": "b8f46f80-5baa-4bd5-9f60-8487abdf317c",
+  "stored_events": 3,
+  "search_hits": 3,
+  "rule_id": "4a913dfa-2ab6-4e3c-9ee8-11d2525d9417",
+  "alert_id": "76872d62-3da7-59e9-8f37-50dc5e438366",
+  "incident_id": "ba658053-b9cc-4bc5-8019-4c33faef2b4f",
+  "kibana": {
+    "data_view_id": "siem-events",
+    "dashboard_id": "siem-overview",
+    "imported": 4
+  },
+  "services": [
+    {
+      "service": "elasticsearch",
+      "available": true,
+      "status": "green",
+      "number_of_nodes": 1,
+      "active_shards": 27
+    },
+    {
+      "service": "logstash",
+      "available": true,
+      "pipelines": [
+        "main"
+      ],
+      "status": "green"
+    },
+    {
+      "service": "kibana",
+      "available": true,
+      "status": "available",
+      "version": "8.17.0"
+    }
+  ]
+}
