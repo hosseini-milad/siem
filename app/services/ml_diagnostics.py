@@ -13,7 +13,7 @@ def label_groups():
             {'$sort': {'_id.label': 1, '_id.type': 1}}]
 
 
-def data_diagnostics(db, sample_size=20000, full_label_counts=False, max_time_ms=30000):
+def data_diagnostics(db, sample_size=20000, full_label_counts=False, max_time_ms=300000):
     excluded = ['_id', 'original_id', 'Label', 'block_index']
     fields = [
         {'$unwind': '$fields'},

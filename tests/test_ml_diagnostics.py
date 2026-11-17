@@ -70,7 +70,7 @@ def test_empty_sample_limits_and_nonfinite_values(setup):
     assert sum(row['non_finite'] for row in rows) == 3
     assert all(row['min'] is None and row['stddev'] is None for row in rows)
     assert client.get('/api/v1/ml/data-diagnostics?sample_size=2').json()['sampled_records'] == 2
-    for params in ['sample_size=0', 'sample_size=50001', 'max_time_ms=999', 'max_time_ms=120001']:
+    for params in ['sample_size=0', 'sample_size=50001', 'max_time_ms=999', 'max_time_ms=900001']:
         assert client.get('/api/v1/ml/data-diagnostics?' + params).status_code == 422
 
 
@@ -83,3 +83,27 @@ def test_timeout_gives_actionable_message(setup, monkeypatch):
     assert response.status_code == 504
     assert 'sample_size' in response.json()['detail']
     assert 'private server details' not in response.text
+
+
+def test_diagnostics_timeout_defaults_and_socket_override(setup, monkeypatch):
+    from pymongo import _csot
+    client, db = setup
+    aggregate = Collection.aggregate
+    observations = []
+    def observe(collection, *args, **kwargs):
+        observations.append((kwargs['maxTimeMS'], _csot.remaining()))
+        return aggregate(collection, *args, **kwargs)
+    monkeypatch.setattr(Collection, 'aggregate', observe)
+    response = client.get('/api/v1/ml/data-diagnostics')
+    assert response.status_code == 200, response.text
+    assert observations[0][0] == 300000
+    assert 300 < observations[0][1] <= 330
+    assert _csot.remaining() is None  # Request deadline must not leak to other work.
+    observations.clear()
+    response = client.get('/api/v1/ml/data-diagnostics?max_time_ms=900000&full_label_counts=true')
+    assert response.status_code == 200, response.text
+    assert len(observations) == 2
+    assert all(cap == 900000 and 1800 < remaining <= 1830 for cap, remaining in observations)
+    spec = client.get('/openapi.json').json()['paths']['/api/v1/ml/data-diagnostics']['get']
+    schema = next(param['schema'] for param in spec['parameters'] if param['name'] == 'max_time_ms')
+    assert schema['default'] == 300000 and schema['maximum'] == 900000

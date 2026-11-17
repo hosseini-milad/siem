@@ -6,8 +6,8 @@ from typing import Literal
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response, Query
 import orjson
 from pydantic import BaseModel, Field
-from pymongo import UpdateOne
-from pymongo.errors import ExecutionTimeout, NetworkTimeout
+from pymongo import UpdateOne, timeout
+from pymongo.errors import PyMongoError
 
 from app.services.ml_diagnostics import data_diagnostics
 
@@ -130,9 +130,16 @@ def predict_matrix(body: MatrixRequest, request: Request):
 @router.get('/data-diagnostics', summary='آمار فقط‌خواندنی کلاس‌ها و ویژگی‌های استاندارد؛ بدون نیاز به mongosh')
 def inspect_data(database: DB, sample_size: int = Query(20000, ge=1, le=50000),
                  full_label_counts: bool = Query(False),
-                 max_time_ms: int = Query(30000, ge=1000, le=120000)):
+                 max_time_ms: int = Query(300000, ge=1000, le=900000)):
     try:
-        return data_diagnostics(database, sample_size, full_label_counts, max_time_ms)
-    except (ExecutionTimeout, NetworkTimeout) as exc:
-        raise HTTPException(504, 'Diagnostics timed out; reduce sample_size or disable full_label_counts. '
-                            'max_time_ms is per aggregation and the MongoDB socket timeout also applies.') from exc
+        # CSOT overrides the client's short socketTimeoutMS for this request only.
+        # Allow both aggregations plus transport/metadata overhead when full counts are requested.
+        budget_seconds = (max_time_ms * (2 if full_label_counts else 1) + 30000) / 1000
+        with timeout(budget_seconds):
+            return data_diagnostics(database, sample_size, full_label_counts, max_time_ms)
+    except PyMongoError as exc:
+        if not exc.timeout:
+            raise
+        raise HTTPException(504, f'Diagnostics timed out with max_time_ms={max_time_ms} per aggregation. '
+                            'Increase max_time_ms up to 900000, reduce sample_size, or disable full_label_counts. '
+                            'The diagnostics request has its own MongoDB timeout budget.') from exc
