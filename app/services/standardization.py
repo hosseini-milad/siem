@@ -36,7 +36,13 @@ def numeric(row, *names):
 
 
 def block_features(originals):
-    rows = [raw_fields(row) for row in originals]
+    relevant = {'src ip', 'source ip', 'dst ip', 'destination ip', 'timestamp',
+                'dst port', 'destination port', 'totlen fwd pkts', 'totlen bwd pkts',
+                'total length of fwd packets', 'total length of bwd packets',
+                'tot fwd pkts', 'tot bwd pkts', 'total fwd packets', 'total backward packets'}
+    keys = set().union(*(row.keys() for row in originals))
+    mapping = [(key, key.strip().casefold()) for key in keys if key.strip().casefold() in relevant]
+    rows = [{name: row[key] for key, name in mapping if key in row} for row in originals]
     sources = [text(row, 'src ip', 'source ip') for row in rows]
     destinations = [text(row, 'dst ip', 'destination ip') for row in rows]
     times = [numeric(row, 'timestamp') for row in rows]

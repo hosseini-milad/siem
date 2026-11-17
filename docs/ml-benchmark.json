@@ -1,0 +1,47 @@
+{
+  "synthetic": true,
+  "threads": 2,
+  "features": 85,
+  "trees": 150,
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+  "model_version": "aa52520ef00e42008515dfd2743761f4",
+  "batch_size": 10000,
+  "repeats": 20,
+  "raw_service": {
+    "p50_ms": 579.2607789990143,
+    "p95_ms": 1478.6501666514616,
+    "max_ms": 4254.760204999911,
+    "eps_at_p95": 6762.924879416146
+  },
+  "matrix_service": {
+    "p50_ms": 17.07207350045792,
+    "p95_ms": 19.408586853023735,
+    "max_ms": 20.087054999748943,
+    "eps_at_p95": 515235.8631634257
+  },
+  "native_inference": {
+    "p50_ms": 12.596845499501796,
+    "p95_ms": 16.936033747333568,
+    "max_ms": 17.79534199886257,
+    "eps_at_p95": 590457.0189920892
+  },
+  "raw_http_no_persistence": {
+    "p50_ms": 713.7863659991126,
+    "p95_ms": 954.4007993994456,
+    "max_ms": 1069.5404079997388,
+    "eps_at_p95": 10477.778315244996
+  },
+  "raw_http_with_mongodb_write": {
+    "p50_ms": 1010.9079480007495,
+    "p95_ms": 1346.216610099691,
+    "max_ms": 1456.3058610001463,
+    "eps_at_p95": 7428.225090210017
+  },
+  "matrix_http": {
+    "p50_ms": 315.8492090005893,
+    "p95_ms": 468.47813079857593,
+    "max_ms": 562.8151599994453,
+    "eps_at_p95": 21345.713583158784
+  },
+  "dataset_note": "Synthetic 50000-row training set; 10000-row requests; simple separable signal, 85 input features, CPU quota 4 cores. No production accuracy or latency guarantee."
+}

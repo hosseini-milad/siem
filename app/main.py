@@ -3,6 +3,8 @@ from threading import Lock
 from datetime import datetime, timezone
 import logging
 
+from app.api.machine_learning import router as machine_learning_router
+from app.services.machine_learning import ModelManager
 from app.api.standardization import router as standardization_router
 from app.api.datasets import router as datasets_router
 from app.api.normalization import router as normalization_router
@@ -23,6 +25,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.ml = ModelManager(config.ml_model_dir, config.ml_threads)
         client = MongoClient(config.mongodb_uri, tz_aware=True, serverSelectionTimeoutMS=config.mongodb_server_selection_timeout_ms,
                              connectTimeoutMS=config.mongodb_connect_timeout_ms,
                              socketTimeoutMS=config.mongodb_socket_timeout_ms)
@@ -43,6 +46,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "interruption_reason": "Server restarted; rerun standardization to rebuild blocks",
                      "interrupted_at": datetime.now(timezone.utc)}})
+                app.state.database.ml_training_runs.update_many(
+                    {"status": "running"}, {"$set": {"status": "interrupted",
+                     "interruption_reason": "Server restarted during training",
+                     "interrupted_at": datetime.now(timezone.utc)}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index([("timestamp", -1), ("_id", -1)])
                 collection.create_index([("source", 1), ("timestamp", -1)])
@@ -53,7 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             client.close()
 
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
-                  description="فاز اول: دریافت و ذخیره لاگ در MongoDB. بدون احراز هویت و هوش مصنوعی.",
+                  description="SIEM: دریافت لاگ، ویژگی‌های رفتاری و تشخیص دوکلاسه با LightGBM.",
                   swagger_ui_parameters={"displayRequestDuration": True},
                   responses={503: {"description": "MongoDB unavailable; batch writes may be partial"}})
     app.state.settings = config
@@ -62,6 +69,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(datasets_router)
     app.include_router(normalization_router)
     app.include_router(standardization_router)
+    app.include_router(machine_learning_router)
 
     @app.exception_handler(PyMongoError)
     async def database_error(request: Request, exc: PyMongoError):

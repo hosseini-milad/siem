@@ -10,3 +10,5 @@ class Settings(BaseSettings):
     mongodb_connect_timeout_ms: int = Field(default=3000, ge=0)
     mongodb_socket_timeout_ms: int = Field(default=60000, ge=0)
     datasets_root: str = "ds/Datasets"
+    ml_model_dir: str = "data/ml"
+    ml_threads: int = Field(default=2, ge=1, le=32)

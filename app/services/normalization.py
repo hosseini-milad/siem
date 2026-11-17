@@ -46,10 +46,14 @@ def number(text):
 
 
 def fit(db, progress=None):
+    return fit_rows(db.dataset_records.find().batch_size(500), progress)
+
+
+def fit_rows(rows, progress=None):
     stats = {}
     count = 0
     reported = monotonic()
-    for row in db.dataset_records.find().batch_size(500):
+    for row in rows:
         label_value(row)
         count += 1
         if progress and (count == 1 or monotonic() - reported >= 5):
