@@ -1,5 +1,6 @@
 """Read raw records alongside the processing results linked to their original IDs."""
 from datetime import timedelta, timezone
+from ipaddress import ip_address
 import math
 import re
 
@@ -9,6 +10,10 @@ TIMEOUT_MS = 30_000
 MAX_CANDIDATES = 1_000
 DATASET_ORDER = [('Timestamp', -1), ('_id', -1)]
 LOG_ORDER = [('timestamp', -1), ('_id', -1)]
+DATASET_IP_COLUMNS = {
+    'source_ip': ('Src IP', 'Source IP', ' Src IP '),
+    'destination_ip': ('Dst IP', 'Destination IP', ' Dst IP '),
+}
 RISK_BANDS = {
     'benign': {'$eq': 0},
     'low': {'$gt': 0, '$lt': .35},
@@ -80,6 +85,26 @@ def indexed_dataset_window(start, end):
     return [{'$match': {'$or': candidates}}]
 
 
+def is_ip_address(value):
+    try:
+        ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def dataset_ip_match(filters, query_ip):
+    def matches(columns, address):
+        return {'$or': [{column: address} for column in columns]}
+
+    clauses = [matches(columns, getattr(filters, key)) for key, columns in DATASET_IP_COLUMNS.items()
+               if getattr(filters, key) is not None]
+    if query_ip:
+        columns = (*DATASET_IP_COLUMNS['source_ip'], *DATASET_IP_COLUMNS['destination_ip'])
+        clauses.append(matches(columns, query_ip))
+    return [{'$match': {'$and': clauses}}] if clauses else []
+
+
 def log_fields():
     return [{'$project': {
         'raw': '$$ROOT', 'timestamp': 1, 'source': 1, 'level': 1, 'message': 1,
@@ -111,13 +136,15 @@ def list_records(database, filters):
     collection = database[COLLECTION if logs else 'dataset_records']
     dates = {operator: value for operator, value in (('$gte', filters.start), ('$lt', filters.end)) if value is not None}
     date_match = [{'$match': {'timestamp': dates}}] if dates else []
+    query = filters.q.strip()
+    query_ip = query if not logs and is_ip_address(query) else None
     order = LOG_ORDER if logs else DATASET_ORDER
     candidate_limit = [{'$sort': dict(order)}, {'$limit': MAX_CANDIDATES}]
     if logs:
         pipeline = date_match + candidate_limit + log_fields()
     else:
         candidates = indexed_dataset_window(filters.start, filters.end)
-        pipeline = candidates + candidate_limit + dataset_fields() + date_match
+        pipeline = candidates + dataset_ip_match(filters, query_ip) + candidate_limit + dataset_fields() + date_match
     protocol = {'$toUpper': {'$ifNull': [convert('$protocol', 'string'), '']}}
     pipeline.append({'$set': {
         'source_port': convert('$source_port', 'int'), 'destination_port': convert('$destination_port', 'int'),
@@ -128,9 +155,9 @@ def list_records(database, filters):
     }})
     criteria = {key: getattr(filters, key) for key in ('source_ip', 'destination_ip', 'source_port',
                                                        'destination_port', 'protocol', 'level')
-                if getattr(filters, key) is not None}
-    if filters.q.strip():
-        literal = {'$regex': re.escape(filters.q.strip()), '$options': 'i'}
+                if getattr(filters, key) is not None and (logs or key not in DATASET_IP_COLUMNS)}
+    if query and not query_ip:
+        literal = {'$regex': re.escape(query), '$options': 'i'}
         fields = ('_id', 'source', 'message', 'level', 'source_ip', 'destination_ip', 'protocol', 'label',
                   'timestamp', 'source_port', 'destination_port')
         pipeline.append({'$set': {'search_fields': [convert('$' + key, 'string') for key in fields]}})

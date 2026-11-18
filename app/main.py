@@ -20,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.logs import router
 from app.core.config import Settings
 from app.models.log import COLLECTION
-from app.services.explorer import DATASET_ORDER, LOG_ORDER
+from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -53,7 +53,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "interruption_reason": "Server restarted during training",
                      "interrupted_at": datetime.now(timezone.utc)}})
-                app.state.database.dataset_records.create_index(DATASET_ORDER)
+                dataset = app.state.database.dataset_records
+                dataset.create_index(DATASET_ORDER)
+                for columns in DATASET_IP_COLUMNS.values():
+                    for column in columns:
+                        dataset.create_index([(column, 1), *DATASET_ORDER],
+                                             partialFilterExpression={column: {'$exists': True}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index(LOG_ORDER)
                 collection.create_index([("source", 1), ("timestamp", -1)])

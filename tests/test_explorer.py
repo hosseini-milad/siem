@@ -134,3 +134,29 @@ def test_candidate_cap_is_independent_of_page_size(tmp_path):
                     assert excluded.json()['total'] == 0
         finally:
             mongo.drop_database(settings.mongodb_database)
+
+
+def test_exact_ip_search_matches_before_candidate_limit(tmp_path):
+    settings = Settings(mongodb_database='siem_test_' + uuid4().hex, ml_model_dir=str(tmp_path))
+    address = '192.168.243.99'
+    with MongoClient(settings.mongodb_uri) as mongo:
+        db = mongo[settings.mongodb_database]
+        try:
+            db.dataset_records.insert_many([
+                {'_id': str(i), 'Timestamp': '1748800000', 'Src IP': '192.168.243.98'}
+                for i in range(1100)
+            ] + [
+                {'_id': 'source', 'Timestamp': '1748784388.981275', 'Src IP': address},
+                {'_id': 'destination', 'Timestamp': '1748784387', 'Destination IP': address},
+            ])
+            with TestClient(create_app(settings)) as client:
+                route = '/api/v1/explorer/records'
+                result = client.get(route, params={'kind': 'data', 'q': address, 'limit': 15, 'offset': 0})
+                assert result.status_code == 200, result.text
+                assert [item['id'] for item in result.json()['items']] == ['source', 'destination']
+                assert result.json()['total'] == 2
+                source = client.get(route, params={'source_ip': address}).json()
+                assert [item['id'] for item in source['items']] == ['source']
+                assert client.get(route, params={'q': address, 'source_ip': '192.168.243.98'}).json()['total'] == 0
+        finally:
+            mongo.drop_database(settings.mongodb_database)
