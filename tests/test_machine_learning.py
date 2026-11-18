@@ -112,6 +112,16 @@ def test_inline_api_persistence_validation_and_model_schema(setup, trained):
     client.app.state.ml.publish(artifact)
     metadata = client.get('/api/v1/ml/model').json()
     assert metadata['features'] == artifact['features'] and 'booster' not in metadata
+    assert 'catboost' not in metadata
+    assert metadata['ensemble'] == artifact['ensemble']
+    requirements = metadata['input_requirements']
+    assert requirements['matrix'] == {'columns': len(artifact['features']), 'dtype': 'float32'}
+    assert requirements['value_range'] == [0, 1]
+    assert 'Label' in requirements['standard']['ignored_fields']
+    assert requirements['raw']['available']
+    assert [field['name'] for field in requirements['raw']['fields']] == [
+        stat['field'] for stat in artifact['normalization_schema']
+    ]
     raw = [{key: value for key, value in row.items() if key != 'Label'} for row in blocks[4]]
     body = {'records': raw, 'persist': True, 'input_format': 'raw'}
     result = client.post('/api/v1/ml/predict', json=body)
@@ -292,6 +302,7 @@ def test_standard_training_uses_stored_behavior_and_never_reads_raw(setup, monke
     assert result['acceptance']['accepted']
     model = client.get('/api/v1/ml/model').json()
     assert model['input_format'] == 'standard'
+    assert model['input_requirements']['raw']['available'] is False
     assert model['feature_importance_gain']['source_record_share'] > 0
     assert model['feature_importance_gain']['constant_original'] == 0
     assert set(block_features([{}])[0]) - {'block_duration_seconds'} <= set(model['features'])

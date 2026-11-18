@@ -11,7 +11,9 @@ from pymongo.errors import PyMongoError
 from app.services.ml_diagnostics import data_diagnostics
 
 from app.api.logs import DB
-from app.services.machine_learning import training_job
+from app.services.machine_learning import EXCLUDED_MODEL_FEATURES, NON_FEATURE_FIELDS, training_job
+from app.services.normalization import EXCLUDED
+from app.services.standardization import BLOCK_SIZE
 
 router = APIRouter(prefix='/api/v1/ml', tags=['Machine Learning'])
 
@@ -25,14 +27,14 @@ class TrainingRequest(BaseModel):
 
 class PredictRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    records: list[dict] = Field(min_length=1, max_length=10000)
+    records: list[dict] = Field(min_length=1, max_length=BLOCK_SIZE)
     input_format: Literal['standard', 'raw'] = 'standard'
     persist: bool = False
 
 
 class MatrixRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    matrix: list[list[float]] = Field(min_length=1, max_length=10000)
+    matrix: list[list[float]] = Field(min_length=1, max_length=BLOCK_SIZE)
 
 
 def active(request):
@@ -46,16 +48,31 @@ def active(request):
 
 @router.get('/model', summary='مدل جاری، ترتیب ویژگی‌ها و مقایسهٔ LightGBM و CatBoost')
 def model(request: Request):
-    predictor = request.app.state.ml.active
-    if predictor is None:
-        raise HTTPException(503, 'No trained model is active')
-    metadata = {key: value for key, value in predictor.artifact.items() if key not in {'booster', 'catboost'}}
-    try:
-        request.app.state.ml.require()
-        metadata['serving_eligible'] = True
-    except LookupError as exc:
-        metadata['serving_eligible'] = False
-        metadata['serving_block_reason'] = str(exc)
+    manager = request.app.state.ml
+    with manager.state_lock:
+        predictor = manager.active
+        if predictor is None:
+            raise HTTPException(503, 'No trained model is active')
+        metadata = {key: value for key, value in predictor.artifact.items() if key not in {'booster', 'catboost'}}
+        try:
+            manager.require()
+            metadata['serving_eligible'] = True
+        except LookupError as exc:
+            metadata['serving_eligible'] = False
+            metadata['serving_block_reason'] = str(exc)
+    schema = metadata.get('normalization_schema') or []
+    metadata['input_requirements'] = {
+        'min_rows': 1,
+        'max_rows': BLOCK_SIZE,
+        'value_range': [0, 1],
+        'matrix': {'columns': len(predictor.names), 'dtype': 'float32'},
+        'standard': {'ignored_fields': sorted(NON_FEATURE_FIELDS | EXCLUDED_MODEL_FEATURES)},
+        'raw': {
+            'available': bool(schema and metadata.get('behavior_bounds')),
+            'fields': [{'name': stat['field'], 'kind': stat['kind']} for stat in schema],
+            'ignored_fields': sorted(EXCLUDED | {'Label'}),
+        },
+    }
     return metadata
 
 
