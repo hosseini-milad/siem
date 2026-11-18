@@ -18,7 +18,7 @@ router = APIRouter(prefix='/api/v1', tags=['Access'])
 Username = Annotated[str, Field(min_length=3, max_length=64, pattern=r'^[A-Za-z0-9_.-]+$')]
 Password = Annotated[SecretStr, Field(min_length=12, max_length=128)]
 Section = Literal['overview', 'ingestion', 'events', 'explorer', 'detections', 'alerts', 'incidents',
-                  'analytics', 'current-model', 'system', 'device-health', 'users']
+                  'analytics', 'current-model', 'system', 'device-health', 'users', 'tasks', 'task-columns']
 Grants = dict[Section, Literal['read', 'write']]
 
 PUBLIC = {'/api/v1/health', '/api/v1/auth/login', '/api/v1/auth/logout'}
@@ -33,7 +33,7 @@ PREFIX = {
     'overview': 'overview', 'dashboard': 'overview', 'logs': 'ingestion', 'ingestion': 'ingestion',
     'search': 'events', 'explorer': 'explorer', 'detections': 'detections', 'alerts': 'alerts',
     'incidents': 'incidents', 'datasets': 'analytics', 'normalization': 'analytics',
-    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'users': 'users', 'device-health': 'device-health',
+    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'users': 'users', 'device-health': 'device-health', 'tasks': 'tasks', 'task-columns': 'task-columns',
 }
 
 
@@ -303,7 +303,7 @@ def update_user(user_id: str, body: UserUpdate, user: User, database: DB):
     if body.username is not None:
         changes['username'] = body.username.lower()
     requires_admin = body.branch is not None or (body.permissions is not None and (
-        'users' in body.permissions or body.permissions.get('device-health') == 'write'))
+        bool({'users', 'task-columns'} & body.permissions.keys()) or body.permissions.get('device-health') == 'write'))
     if requires_admin and (user['role'] != 'manager' or body.system is not None):
         raise HTTPException(403, 'تغییر شاخه یا این مجوزها برای این حساب مجاز نیست.')
     if requires_admin:

@@ -8,7 +8,7 @@ SECTIONS = {
     'overview': 'نمای کلی', 'ingestion': 'ورود و پردازش', 'events': 'جست‌وجوی رویدادها',
     'explorer': 'کاوش داده‌ها', 'detections': 'قواعد تشخیص', 'alerts': 'هشدارها',
     'incidents': 'رخدادهای امنیتی', 'analytics': 'تحلیل هوشمند', 'current-model': 'مدل جاری',
-    'system': 'سامانه', 'device-health': 'سلامت سیستم‌ها', 'users': 'کاربران',
+    'system': 'سامانه', 'device-health': 'سلامت سیستم‌ها', 'users': 'کاربران', 'tasks': 'تسک‌ها', 'task-columns': 'مدیریت ستون تسک‌ها',
 }
 COOKIE = 'siem_session'
 SESSION_SECONDS = 8 * 60 * 60
@@ -53,5 +53,7 @@ def initialize_access(database):
     database.users.create_index('username', unique=True)
     database.users.create_index('device_id', unique=True, partialFilterExpression={'device_id': {'$type': 'string'}})
     database.users.create_index([('role', 1), ('created_by', 1), ('username', 1)])
+    database.tasks.create_index([('board', 1), ('created_at', -1), ('_id', 1)])
+    database.task_columns.create_index('board')
     database.sessions.create_index('expires_at', expireAfterSeconds=0)
     database.login_attempts.create_index('expires_at', expireAfterSeconds=0)

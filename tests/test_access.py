@@ -130,3 +130,76 @@ def test_branch_hierarchy_and_system_profiles(application):
     assert login(client, 'new-host').status_code == 200
     assert [row['id'] for row in client.get('/api/v1/device-health').json()['items']] == [east]
     assert client.patch(f'/api/v1/device-health/{east}', json=profile).status_code == 403
+
+
+def test_task_assignment_and_column_visibility(application):
+    manager, app = application
+    assert manager.get('/api/v1/tasks/boards').status_code == 401
+    login(manager, 'manager')
+    admins = []
+    clients = []
+    for branch in ('east', 'west'):
+        created = manager.post('/api/v1/users', json={
+            'username': branch, 'name': branch, 'password': PASSWORD, 'branch': branch,
+            'permissions': {'tasks': 'write', 'task-columns': 'write', 'users': 'write'},
+        })
+        admin_id = created.json()['id']
+        admin = TestClient(app, base_url='https://testserver')
+        assert login(admin, branch).status_code == 200
+        admins.append((admin_id, admin))
+        for member in ('one', 'two') if branch == 'east' else ('three',):
+            created = admin.post('/api/v1/users', json={
+                'username': member, 'name': member, 'password': PASSWORD, 'system': {},
+            })
+            client_id = created.json()['id']
+            assert manager.patch('/api/v1/users/' + client_id, json={'permissions': {'tasks': 'write'}}).status_code == 200
+            client = TestClient(app, base_url='https://testserver')
+            assert login(client, member).status_code == 200
+            clients.append((client_id, client))
+    (east_id, east), (west_id, west) = admins
+    (one_id, one), (two_id, two), (three_id, three) = clients
+    assert manager.post('/api/v1/tasks', json={'title': 'invalid', 'assignees': [one_id]}).status_code == 422
+    assert one.post('/api/v1/tasks', json={'title': 'invalid', 'assignees': [three_id]}).status_code == 422
+    assert one.get('/api/v1/task-columns').status_code == 403
+    assert west.get('/api/v1/tasks', params={'board': east_id}).status_code == 404
+    central = manager.post('/api/v1/tasks', json={'title': 'Central', 'assignees': [east_id, west_id]})
+    assert central.status_code == 201, central.text
+    central_path = '/api/v1/tasks/' + central.json()['id']
+    assert [row['id'] for row in east.get(central_path).json()['assignees']] == [east_id]
+    assert east.patch(central_path, json={'revision': 0, 'assignees': [one_id]}).status_code == 403
+    assert one.get(central_path).status_code == 404
+
+    branch_task = east.post('/api/v1/tasks', json={'title': 'Branch', 'assignees': [one_id], 'priority': 'high'})
+    assert branch_task.status_code == 201, branch_task.text
+    item = branch_task.json()
+    path = '/api/v1/tasks/' + item['id']
+    assert two.get(path).status_code == 404
+    assert three.get(path).status_code == 404
+    assert one.post('/api/v1/tasks', json={'title': 'Peer', 'assignees': [one_id, two_id]}).status_code == 201
+    column = east.post('/api/v1/task-columns', json={'title': 'Review', 'position': 25, 'audience': 'branch'})
+    assert column.status_code == 201, column.text
+    column_id = column.json()['id']
+    assert west.patch(f'/api/v1/task-columns/{column_id}',
+                      json={'title': 'Bad', 'position': 20}).status_code == 404
+    assert one.patch(path, json={'revision': 0, 'column_id': column_id}).status_code == 200
+    assert two.get(path).status_code == 200
+    assert three.get(path).status_code == 404
+    column_path = '/api/v1/task-columns/' + column_id
+    assert east.patch(column_path, json={'title': 'Review', 'position': 25,
+                      'audience': 'selected', 'viewers': [three_id]}).status_code == 422
+    assert east.patch(column_path, json={'title': 'Review', 'position': 25,
+                      'audience': 'participants'}).status_code == 200
+    assert two.get(path).status_code == 404
+    assert east.patch(column_path, json={'title': 'Review', 'position': 25,
+                      'audience': 'selected', 'viewers': [two_id]}).status_code == 200
+    assert two.get(path).status_code == 200
+    assert two.patch(path, json={'revision': 1, 'column_id': 'done'}).status_code == 403
+    comment = two.post(path + '/comments', json={'text': 'Needs review'})
+    assert comment.status_code == 201 and comment.json()['comments'][0]['author'] == 'two'
+    assert east.patch(path, json={'revision': 0, 'column_id': 'doing'}).status_code == 409
+    closed = one.patch(path, json={'revision': 1, 'column_id': 'done'})
+    assert closed.status_code == 200 and closed.json()['closed_at']
+    assert one.patch(path, json={'revision': 2, 'column_id': 'todo'}).status_code == 403
+    page = manager.get('/api/v1/tasks', params={'board': east_id}).json()
+    assert page['total'] == 2
+    assert next(row for row in page['items'] if row['id'] == item['id'])['comment_count'] == 1

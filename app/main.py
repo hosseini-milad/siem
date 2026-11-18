@@ -3,7 +3,7 @@ from threading import Lock
 from datetime import datetime, timezone
 import logging
 
-from app.api import access, alerts, dashboard, detections, explorer, incidents, ingestion, search, system
+from app.api import access, alerts, dashboard, detections, explorer, incidents, ingestion, search, system, tasks
 
 from app.api.machine_learning import router as machine_learning_router
 from app.services.machine_learning import ModelManager
@@ -79,7 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
                   description="SIEM هوشمند: رویدادها، هشدارها، قواعد، رخدادها، جست‌وجوی MongoDB و مدل‌های LightGBM/CatBoost. با احراز هویت و کنترل دسترسی.",
                   dependencies=[Depends(access.authorize)],
-                  openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}],
+                  openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}, {"name": "Tasks"}],
                   swagger_ui_parameters={"displayRequestDuration": True, "docExpansion": "none"},
                   responses={503: {"description": "MongoDB operation unavailable; batch writes may be partial"}})
     app.state.settings = config
@@ -90,7 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(normalization_router)
     app.include_router(standardization_router)
     app.include_router(machine_learning_router)
-    for module in (ingestion, search, explorer, dashboard, detections, alerts, incidents, system):
+    for module in (ingestion, search, explorer, dashboard, detections, alerts, incidents, system, tasks):
         app.include_router(module.router)
 
     @app.exception_handler(RequestValidationError)

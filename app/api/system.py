@@ -45,8 +45,12 @@ def navigation(request: Request, response: Response):
         for key, parent in (('explorer', 'events'), ('current-model', 'analytics'), ('device-health', 'system'), ('users', 'system')):
             index = next(i for i, menu in enumerate(menus) if menu['id'] == parent)
             menus.insert(index + 1, {'id': key, 'label': SECTIONS[key], 'parent': parent, 'tags': []})
+        menus.extend([
+            {'id': 'tasks', 'label': SECTIONS['tasks'], 'tags': ['Tasks']},
+            {'id': 'task-columns', 'label': SECTIONS['task-columns'], 'parent': 'tasks', 'tags': []},
+        ])
         menus = [menu for menu in menus if allowed(user, menu['id']) and
-                 (menu['id'] != 'users' or user['role'] != 'client')]
+                 (menu['id'] not in {'users', 'task-columns'} or user['role'] != 'client')]
     return {
         'authentication': request.app.state.settings.auth_required,
         'agents_in_scope': False,
