@@ -90,3 +90,29 @@ def test_explorer_uses_timestamp_index_for_2025_seconds(tmp_path):
                 assert plan['executionStats']['totalDocsExamined'] < 20
         finally:
             mongo.drop_database(settings.mongodb_database)
+
+
+def test_candidate_cap_is_independent_of_page_size(tmp_path):
+    settings = Settings(mongodb_database='siem_test_' + uuid4().hex, ml_model_dir=str(tmp_path))
+    stamp = datetime(2025, 5, 18, 12, tzinfo=timezone.utc)
+    with MongoClient(settings.mongodb_uri) as mongo:
+        db = mongo[settings.mongodb_database]
+        try:
+            for collection, fields in [
+                (db.dataset_records, {'Timestamp': str(int(stamp.timestamp()))}),
+                (db.log_events, {'timestamp': stamp, 'message': 'Example', 'source': 'test', 'level': 'INFO'}),
+            ]:
+                collection.insert_many([{'_id': f'example-{index:04}', **fields} for index in range(1010)])
+            with TestClient(create_app(settings)) as client:
+                for kind in ('data', 'logs'):
+                    path = '/api/v1/explorer/records'
+                    params = {'kind': kind, 'start': '2025-05-18T00:00:00Z', 'end': '2025-05-19T00:00:00Z'}
+                    page = client.get(path, params={**params, 'limit': 15, 'offset': 990})
+                    assert page.status_code == 200, page.text
+                    assert page.json()['total'] == 1000
+                    assert len(page.json()['items']) == 10
+                    assert client.get(path, params={**params, 'offset': 1000}).json()['items'] == []
+                    excluded = client.get(path, params={**params, 'q': 'example-0000'})
+                    assert excluded.json()['total'] == 0
+        finally:
+            mongo.drop_database(settings.mongodb_database)

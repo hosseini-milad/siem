@@ -6,6 +6,9 @@ import re
 from app.models.log import COLLECTION
 
 TIMEOUT_MS = 30_000
+MAX_CANDIDATES = 1_000
+DATASET_ORDER = [('Timestamp', -1), ('_id', -1)]
+LOG_ORDER = [('timestamp', -1), ('_id', -1)]
 RISK_BANDS = {
     'low': {'$gte': 0, '$lt': .35},
     'medium': {'$gte': .35, '$lt': .65},
@@ -93,10 +96,13 @@ def list_records(database, filters):
     collection = database[COLLECTION if logs else 'dataset_records']
     dates = {operator: value for operator, value in (('$gte', filters.start), ('$lt', filters.end)) if value is not None}
     date_match = [{'$match': {'timestamp': dates}}] if dates else []
+    order = LOG_ORDER if logs else DATASET_ORDER
+    candidate_limit = [{'$sort': dict(order)}, {'$limit': MAX_CANDIDATES}]
     if logs:
-        pipeline = date_match + log_fields()
+        pipeline = date_match + candidate_limit + log_fields()
     else:
-        pipeline = indexed_dataset_window(filters.start, filters.end) + dataset_fields() + date_match
+        candidates = indexed_dataset_window(filters.start, filters.end)
+        pipeline = candidates + candidate_limit + dataset_fields() + date_match
     protocol = {'$toUpper': {'$ifNull': [convert('$protocol', 'string'), '']}}
     pipeline.append({'$set': {
         'source_port': convert('$source_port', 'int'), 'destination_port': convert('$destination_port', 'int'),

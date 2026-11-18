@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.logs import router
 from app.core.config import Settings
 from app.models.log import COLLECTION
+from app.services.explorer import DATASET_ORDER, LOG_ORDER
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -52,9 +53,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "interruption_reason": "Server restarted during training",
                      "interrupted_at": datetime.now(timezone.utc)}})
-                app.state.database.dataset_records.create_index('Timestamp')
+                app.state.database.dataset_records.create_index(DATASET_ORDER)
                 collection = app.state.database[COLLECTION]
-                collection.create_index([("timestamp", -1), ("_id", -1)])
+                collection.create_index(LOG_ORDER)
                 collection.create_index([("source", 1), ("timestamp", -1)])
                 collection.create_index([("level", 1), ("timestamp", -1)])
                 app.state.database.siem_alerts.create_index([("status", 1), ("severity", 1), ("created_at", -1)])
