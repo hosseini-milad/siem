@@ -58,7 +58,7 @@ def test_roles_grants_and_session_revocation(application):
     assert admin.post('/api/v1/alerts/from-predictions').status_code == 403
     assert admin.get('/api/v1/logs').status_code == 403
     assert admin.get('/api/v1/explorer/records').status_code == 403
-    assert {row['id'] for row in admin.get('/api/v1/system/navigation').json()['menus']} == {'users', 'alerts'}
+    assert {row['id'] for row in admin.get('/api/v1/system/navigation').json()['menus']} == {'users', 'alerts', 'tasks'}
     payload = {'username': 'endpoint', 'name': 'Endpoint', 'password': PASSWORD, 'device_id': 'soc'}
     assert admin.post('/api/v1/users', json={**payload, 'permissions': {'system': 'write'}}).status_code == 403
     assert admin.post('/api/v1/users', json={**payload, 'device_id': None}).status_code == 422
@@ -69,11 +69,11 @@ def test_roles_grants_and_session_revocation(application):
     target = '/api/v1/users/' + registered.json()['id']
     assert login(client, 'endpoint').status_code == 200
     assert client.get('/api/v1/users').status_code == 403
-    assert client.get('/api/v1/system/navigation').json()['menus'] == []
+    assert [row['id'] for row in client.get('/api/v1/system/navigation').json()['menus']] == ['tasks']
     assert manager.patch(target, json={'permissions': {'device-health': 'write'}}).status_code == 404
     assert admin.patch(target, json={'permissions': {'device-health': 'read'}}).status_code == 403
     assert manager.patch(target, json={'permissions': {'device-health': 'read'}}).status_code == 200
-    assert [row['id'] for row in client.get('/api/v1/system/navigation').json()['menus']] == ['device-health']
+    assert [row['id'] for row in client.get('/api/v1/system/navigation').json()['menus']] == ['device-health', 'tasks']
     assert admin.patch(target, json={'active': False}).status_code == 200
     assert client.get('/api/v1/auth/me').status_code == 401
     assert login(client, 'endpoint').status_code == 401
@@ -178,7 +178,9 @@ def test_task_assignment_and_column_visibility(application):
     assert two.get(path).status_code == 404
     assert two.get('/api/v1/tasks', params={'board': east_id}).json()['tag_suggestions'] == []
     assert three.get(path).status_code == 404
-    assert one.post('/api/v1/tasks', json={'title': 'Peer', 'assignees': [one_id, two_id]}).status_code == 201
+    peer = one.post('/api/v1/tasks', json={'title': 'Peer', 'assignees': [two_id]})
+    assert peer.status_code == 201
+    assert one.get('/api/v1/tasks/' + peer.json()['id']).status_code == 200
     column = east.post('/api/v1/task-columns', json={'title': 'Review', 'position': 25, 'audience': 'branch'})
     assert column.status_code == 201, column.text
     column_id = column.json()['id']
@@ -217,7 +219,7 @@ def test_task_assignment_without_menu_privilege_and_expiration(application):
     assert login(manager, 'manager').status_code == 200
     admin_id = manager.post('/api/v1/users', json={
         'username': 'worker', 'name': 'Admin', 'password': PASSWORD,
-        'permissions': {'users': 'write', 'tasks': 'write', 'task-columns': 'write'},
+        'permissions': {'users': 'write', 'task-columns': 'write'},
     }).json()['id']
     admin = TestClient(app, base_url='https://testserver')
     assert login(admin, 'worker').status_code == 200
@@ -226,24 +228,29 @@ def test_task_assignment_without_menu_privilege_and_expiration(application):
     }).json()
     target = endpoint['id']
     path = '/api/v1/tasks'
-    assert {item['id'] for item in admin.get(path, params={'board': admin_id}).json()['assignees']} == {target}
+    assert {item['id'] for item in admin.get(path, params={'board': admin_id}).json()['assignees']} == {target, admin_id}
     client = TestClient(app, base_url='https://testserver')
-    assert login(client, 'device').json()['task_access'] is False
-    assert client.get(path, params={'board': admin_id}).status_code == 403
+    assert login(client, 'device').json()['task_access'] is True
+    assert client.get(path, params={'board': admin_id}).json()['can_create'] is True
+    personal = client.post(path, json={'title': 'Personal', 'assignees': [target]})
+    assert personal.status_code == 201, personal.text
+    assert client.get(path, params={'board': admin_id}).json()['total'] == 1
     task = admin.post(path, json={'title': 'Review', 'assignees': [target], 'tags': [' Design ', 'design', 'new']})
     assert task.status_code == 201, task.text
     assert task.json()['tags'] == ['Design', 'new']
     item = path + '/' + task.json()['id']
     assert client.get('/api/v1/auth/me').json()['task_access'] is True
     assert client.get('/api/v1/system/navigation').json()['menus'][0]['id'] == 'tasks'
-    assert client.post(path, json={'title': 'Denied', 'assignees': [target]}).status_code == 403
+    assert client.get(item).json()['can_assign'] is True
     assert client.post(item + '/comments', json={'text': 'Seen'}).json()['updated_by'] == 'Client'
     assert admin.patch(item, json={'revision': 0, 'tags': ['review']}).json()['tags'] == ['review']
-    assert client.patch(item, json={'revision': 1, 'column_id': 'done'}).status_code == 200
+    assert client.patch(item, json={'revision': 1, 'assignees': [target], 'priority': 'high'}).status_code == 200
+    assert client.patch(item, json={'revision': 2, 'column_id': 'done'}).status_code == 200
     assert admin.get(path, params={'board': admin_id}).json()['total'] == 1
     app.state.database.tasks.update_one({'_id': task.json()['id']}, {'$set': {'closed_at': now() - timedelta(days=1)}})
     page = admin.get(path, params={'board': admin_id}).json()
-    assert page['total'] == 0 and page['tag_suggestions'] == ['review']
+    assert page['total'] == 0
+    assert [card['id'] for card in client.get(path).json()['items']] == [personal.json()['id']]
     assert admin.get(item).status_code == 404
     assert app.state.database.tasks.find_one({'_id': task.json()['id']}) is not None
-    assert client.get('/api/v1/auth/me').json()['task_access'] is False
+    assert client.get('/api/v1/auth/me').json()['task_access'] is True

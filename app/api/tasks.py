@@ -109,7 +109,7 @@ def visible_tasks(user, board, stages, *, include_history=False):
     if not include_history or not allowed(user, 'tasks'):
         scope.update(visible_task_lifetime())
     if not allowed(user, 'tasks'):
-        return {**scope, 'assignees': user['_id']}
+        return {**scope, '$and': [participant(user)]}
     if is_supervisor(user, board):
         return scope
     conditions = participant(user)['$or']
@@ -123,9 +123,10 @@ def candidates(user, *, for_visibility=False):
     scope = {'active': True}
     if for_visibility:
         scope['permissions.tasks'] = {'$in': ['read', 'write']}
-    if user['role'] == 'manager':
-        return {**scope, 'role': 'admin'}
-    return {**scope, 'role': 'client', 'created_by': own_board(user)}
+    peers = {'role': 'admin'} if user['role'] == 'manager' else {'role': 'client', 'created_by': own_board(user)}
+    if for_visibility:
+        return {**scope, **peers}
+    return {**scope, '$or': [peers, {'_id': user['_id']}]}
 
 
 def member_options(database, user, *, for_visibility=False):
@@ -156,8 +157,8 @@ def fetch_task(database, user, task_id):
 def task_view(task, user, names, include_comments=False):
     identity = user['_id']
     supervisor = is_supervisor(user, task['board'])
-    write = allowed(user, 'tasks', write=True) or (
-        'tasks' not in user.get('permissions', {}) and identity in task['assignees'])
+    participates = identity == task['creator'] or identity in task['assignees']
+    can_move = task['closed_at'] is None and (supervisor or participates)
     assignees = task['assignees']
     restricted = task['board'] == CENTRAL and user['role'] != 'manager'
     if restricted:
@@ -169,11 +170,9 @@ def task_view(task, user, names, include_comments=False):
         creator=names.get(task['creator'], '—'),
         assignees=[{'id': key, 'name': names.get(key, '—')} for key in assignees],
         comment_count=task['comment_count'],
-        can_comment=write,
-        can_move=write and task['closed_at'] is None and (
-            supervisor or identity == task['creator'] or identity in task['assignees']),
-        can_assign=write and task['closed_at'] is None and task['board'] == own_board(user) and (
-            supervisor or identity == task['creator']),
+        can_comment=supervisor or participates or allowed(user, 'tasks', write=True),
+        can_move=can_move,
+        can_assign=can_move and task['board'] == own_board(user),
     )
     if include_comments:
         item['comments'] = [{**comment, 'author': (
@@ -234,7 +233,7 @@ def list_tasks(user: User, database: DB, response: Response, board: Identifier |
     scope = {'$or': [visible_tasks(user, identity, stages) for identity, stages in by_board.items()]}
     rows = list(database.tasks.find(scope, {'comments': 0}).sort([('created_at', -1), ('_id', 1)]).skip(offset).limit(limit))
     names = task_names(database, rows)
-    can_create = own in by_board and allowed(user, 'tasks', write=True)
+    can_create = own in by_board
     visible_columns = {}
     for stages in by_board.values():
         for stage in stages:
@@ -253,8 +252,6 @@ def list_tasks(user: User, database: DB, response: Response, board: Identifier |
 
 @router.post('/tasks', status_code=201)
 def create_task(body: NewTask, user: User, database: DB):
-    if not allowed(user, 'tasks', write=True):
-        raise HTTPException(403, 'اجازهٔ ایجاد تسک را ندارید.')
     board = own_board(user)
     board_scope(user, board, database)
     validate_assignees(database, user, body.assignees)

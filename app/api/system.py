@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Response
 
 from app.db.session import DB
-from app.services.access import SECTIONS, allowed, has_task_assignment
+from app.services.access import SECTIONS, allowed
 
 router = APIRouter(prefix='/api/v1')
 
@@ -49,8 +49,7 @@ def navigation(request: Request, response: Response):
             {'id': 'tasks', 'label': SECTIONS['tasks'], 'tags': ['Tasks']},
             {'id': 'task-columns', 'label': SECTIONS['task-columns'], 'parent': 'tasks', 'tags': []},
         ])
-        menus = [menu for menu in menus if (allowed(user, menu['id']) or
-                 (menu['id'] == 'tasks' and has_task_assignment(request.app.state.database, user))) and
+        menus = [menu for menu in menus if (menu['id'] == 'tasks' or allowed(user, menu['id'])) and
                  (menu['id'] not in {'users', 'task-columns'} or user['role'] != 'client')]
     return {
         'authentication': request.app.state.settings.auth_required,
