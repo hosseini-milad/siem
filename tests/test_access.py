@@ -169,11 +169,14 @@ def test_task_assignment_and_column_visibility(application):
     assert east.patch(central_path, json={'revision': 0, 'assignees': [one_id]}).status_code == 403
     assert one.get(central_path).status_code == 404
 
-    branch_task = east.post('/api/v1/tasks', json={'title': 'Branch', 'assignees': [one_id], 'priority': 'high'})
+    branch_task = east.post('/api/v1/tasks', json={'title': 'Branch', 'assignees': [one_id], 'priority': 'high', 'tags': ['restricted']})
     assert branch_task.status_code == 201, branch_task.text
     item = branch_task.json()
     path = '/api/v1/tasks/' + item['id']
+    assert {card['title'] for card in east.get('/api/v1/tasks').json()['items']} == {'Central', 'Branch'}
+    assert {card['title'] for card in manager.get('/api/v1/tasks').json()['items']} == {'Central', 'Branch'}
     assert two.get(path).status_code == 404
+    assert two.get('/api/v1/tasks', params={'board': east_id}).json()['tag_suggestions'] == []
     assert three.get(path).status_code == 404
     assert one.post('/api/v1/tasks', json={'title': 'Peer', 'assignees': [one_id, two_id]}).status_code == 201
     column = east.post('/api/v1/task-columns', json={'title': 'Review', 'position': 25, 'audience': 'branch'})
@@ -239,7 +242,8 @@ def test_task_assignment_without_menu_privilege_and_expiration(application):
     assert client.patch(item, json={'revision': 1, 'column_id': 'done'}).status_code == 200
     assert admin.get(path, params={'board': admin_id}).json()['total'] == 1
     app.state.database.tasks.update_one({'_id': task.json()['id']}, {'$set': {'closed_at': now() - timedelta(days=1)}})
-    assert admin.get(path, params={'board': admin_id}).json()['total'] == 0
+    page = admin.get(path, params={'board': admin_id}).json()
+    assert page['total'] == 0 and page['tag_suggestions'] == ['review']
     assert admin.get(item).status_code == 404
     assert app.state.database.tasks.find_one({'_id': task.json()['id']}) is not None
     assert client.get('/api/v1/auth/me').json()['task_access'] is False

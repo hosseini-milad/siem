@@ -104,8 +104,10 @@ def participant(user):
     return {'$or': [{'creator': user['_id']}, {'assignees': user['_id']}]}
 
 
-def visible_tasks(user, board, stages):
-    scope = {'board': board, **visible_task_lifetime()}
+def visible_tasks(user, board, stages, *, include_history=False):
+    scope = {'board': board}
+    if not include_history or not allowed(user, 'tasks'):
+        scope.update(visible_task_lifetime())
     if not allowed(user, 'tasks'):
         return {**scope, 'assignees': user['_id']}
     if is_supervisor(user, board):
@@ -209,18 +211,43 @@ def boards(user: User, database: DB):
     return {'items': items}
 
 
+def historical_tags(database, scope):
+    return [row['_id'] for row in database.tasks.aggregate([
+        {'$match': scope},
+        {'$unwind': '$tags'},
+        {'$group': {'_id': '$tags', 'used': {'$max': '$created_at'}}},
+        {'$sort': {'used': -1, '_id': 1}},
+        {'$limit': 100},
+    ])]
+
+
 @router.get('/tasks')
-def list_tasks(user: User, database: DB, response: Response, board: Identifier,
+def list_tasks(user: User, database: DB, response: Response, board: Identifier | None = None,
                offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=100)):
-    board_scope(user, board, database)
-    stages = columns(database, board)
-    scope = visible_tasks(user, board, stages)
+    own = own_board(user)
+    if board is not None:
+        board_scope(user, board, database)
+        board_ids = [board]
+    else:
+        board_ids = [item['id'] for item in boards(user, database)['items']]
+    by_board = {identity: columns(database, identity) for identity in board_ids}
+    scope = {'$or': [visible_tasks(user, identity, stages) for identity, stages in by_board.items()]}
     rows = list(database.tasks.find(scope, {'comments': 0}).sort([('created_at', -1), ('_id', 1)]).skip(offset).limit(limit))
     names = task_names(database, rows)
-    can_create = board == own_board(user) and allowed(user, 'tasks', write=True)
+    can_create = own in by_board and allowed(user, 'tasks', write=True)
+    visible_columns = {}
+    for stages in by_board.values():
+        for stage in stages:
+            visible_columns.setdefault(stage['id'], {key: value for key, value in stage.items() if key != 'viewers'})
+    cards = [task_view(task, user, names) | {
+        'move_columns': [stage['id'] for stage in by_board[task['board']]],
+    } for task in rows]
     response.headers['Cache-Control'] = 'no-store'
-    return {'items': [task_view(task, user, names) for task in rows], 'columns': [{key: value for key, value in stage.items() if key != 'viewers'} for stage in stages],
+    tag_scope = {'$or': [visible_tasks(user, identity, stages, include_history=True)
+                        for identity, stages in by_board.items()]}
+    return {'items': cards, 'columns': sorted(visible_columns.values(), key=lambda stage: (stage['position'], stage['id'])),
             'total': database.tasks.count_documents(scope), 'offset': offset, 'limit': limit,
+            'tag_suggestions': historical_tags(database, tag_scope) if can_create else [],
             'can_create': can_create, 'assignees': member_options(database, user) if can_create else []}
 
 
