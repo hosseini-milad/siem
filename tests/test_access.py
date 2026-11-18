@@ -203,3 +203,43 @@ def test_task_assignment_and_column_visibility(application):
     page = manager.get('/api/v1/tasks', params={'board': east_id}).json()
     assert page['total'] == 2
     assert next(row for row in page['items'] if row['id'] == item['id'])['comment_count'] == 1
+
+
+def test_task_assignment_without_menu_privilege_and_expiration(application):
+    from datetime import timedelta
+
+    from app.services.access import now
+
+    manager, app = application
+    assert login(manager, 'manager').status_code == 200
+    admin_id = manager.post('/api/v1/users', json={
+        'username': 'worker', 'name': 'Admin', 'password': PASSWORD,
+        'permissions': {'users': 'write', 'tasks': 'write', 'task-columns': 'write'},
+    }).json()['id']
+    admin = TestClient(app, base_url='https://testserver')
+    assert login(admin, 'worker').status_code == 200
+    endpoint = admin.post('/api/v1/users', json={
+        'username': 'device', 'name': 'Client', 'password': PASSWORD, 'system': {},
+    }).json()
+    target = endpoint['id']
+    path = '/api/v1/tasks'
+    assert {item['id'] for item in admin.get(path, params={'board': admin_id}).json()['assignees']} == {target}
+    client = TestClient(app, base_url='https://testserver')
+    assert login(client, 'device').json()['task_access'] is False
+    assert client.get(path, params={'board': admin_id}).status_code == 403
+    task = admin.post(path, json={'title': 'Review', 'assignees': [target], 'tags': [' Design ', 'design', 'new']})
+    assert task.status_code == 201, task.text
+    assert task.json()['tags'] == ['Design', 'new']
+    item = path + '/' + task.json()['id']
+    assert client.get('/api/v1/auth/me').json()['task_access'] is True
+    assert client.get('/api/v1/system/navigation').json()['menus'][0]['id'] == 'tasks'
+    assert client.post(path, json={'title': 'Denied', 'assignees': [target]}).status_code == 403
+    assert client.post(item + '/comments', json={'text': 'Seen'}).json()['updated_by'] == 'Client'
+    assert admin.patch(item, json={'revision': 0, 'tags': ['review']}).json()['tags'] == ['review']
+    assert client.patch(item, json={'revision': 1, 'column_id': 'done'}).status_code == 200
+    assert admin.get(path, params={'board': admin_id}).json()['total'] == 1
+    app.state.database.tasks.update_one({'_id': task.json()['id']}, {'$set': {'closed_at': now() - timedelta(days=1)}})
+    assert admin.get(path, params={'board': admin_id}).json()['total'] == 0
+    assert admin.get(item).status_code == 404
+    assert app.state.database.tasks.find_one({'_id': task.json()['id']}) is not None
+    assert client.get('/api/v1/auth/me').json()['task_access'] is False

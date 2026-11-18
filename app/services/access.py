@@ -1,7 +1,7 @@
 import hashlib
 import hmac
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import BoundedSemaphore
 
 SECTIONS = {
@@ -49,11 +49,20 @@ def allowed(user, section, write=False):
     return grant == 'write' or (not write and grant == 'read')
 
 
+def visible_task_lifetime():
+    return {'$or': [{'closed_at': None}, {'closed_at': {'$gt': now() - timedelta(days=1)}}]}
+
+
+def has_task_assignment(database, user):
+    return database.tasks.find_one({'assignees': user['_id'], **visible_task_lifetime()}, {'_id': 1}) is not None
+
+
 def initialize_access(database):
     database.users.create_index('username', unique=True)
     database.users.create_index('device_id', unique=True, partialFilterExpression={'device_id': {'$type': 'string'}})
     database.users.create_index([('role', 1), ('created_by', 1), ('username', 1)])
     database.tasks.create_index([('board', 1), ('created_at', -1), ('_id', 1)])
+    database.tasks.create_index([('assignees', 1), ('closed_at', 1)])
     database.task_columns.create_index('board')
     database.sessions.create_index('expires_at', expireAfterSeconds=0)
     database.login_attempts.create_index('expires_at', expireAfterSeconds=0)

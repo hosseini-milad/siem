@@ -2,12 +2,12 @@ from typing import Annotated, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pymongo import ReturnDocument
 
 from app.api.access import User
 from app.db.session import DB
-from app.services.access import allowed, now
+from app.services.access import allowed, now, visible_task_lifetime
 
 router = APIRouter(prefix='/api/v1', tags=['Tasks'])
 CENTRAL = 'central'
@@ -33,14 +33,31 @@ class Column(Input):
     viewers: list[Identifier] = Field(default_factory=list, max_length=100)
 
 
-class NewTask(Input):
+class Tagged(Input):
+    tags: list[str] | None = Field(default=None, max_length=8)
+
+    @field_validator('tags')
+    @classmethod
+    def normalize_tags(cls, values):
+        if values is None:
+            return None
+        labels = {}
+        for value in values:
+            label = value.strip()
+            if not 1 <= len(label) <= 24:
+                raise ValueError('Tags must contain 1–24 characters')
+            labels.setdefault(label.casefold(), label)
+        return list(labels.values())
+
+
+class NewTask(Tagged):
     title: str = Field(min_length=1, max_length=120)
     description: str = Field(default='', max_length=4000)
     priority: Priority = 'normal'
     assignees: Assignees
 
 
-class TaskUpdate(Input):
+class TaskUpdate(Tagged):
     revision: int = Field(ge=0)
     column_id: Identifier | None = None
     assignees: Assignees | None = None
@@ -88,31 +105,35 @@ def participant(user):
 
 
 def visible_tasks(user, board, stages):
-    scope = {'board': board}
+    scope = {'board': board, **visible_task_lifetime()}
+    if not allowed(user, 'tasks'):
+        return {**scope, 'assignees': user['_id']}
     if is_supervisor(user, board):
         return scope
     conditions = participant(user)['$or']
     if board != CENTRAL:
         conditions.append({'column_id': {'$in': [stage['id'] for stage in stages
             if stage['audience'] == 'branch' or (stage['audience'] == 'selected' and user['_id'] in stage['viewers'])]}})
-    return {**scope, '$or': conditions}
+    return {**scope, '$and': [{'$or': conditions}]}
 
 
-def candidates(user):
-    scope = {'active': True, 'permissions.tasks': {'$in': ['read', 'write']}}
+def candidates(user, *, for_visibility=False):
+    scope = {'active': True}
+    if for_visibility:
+        scope['permissions.tasks'] = {'$in': ['read', 'write']}
     if user['role'] == 'manager':
         return {**scope, 'role': 'admin'}
     return {**scope, 'role': 'client', 'created_by': own_board(user)}
 
 
-def member_options(database, user):
+def member_options(database, user, *, for_visibility=False):
     return [{'id': row['_id'], 'name': row['name'], 'username': row['username']}
-            for row in database.users.find(candidates(user), {'name': 1, 'username': 1}).sort('name', 1)]
+            for row in database.users.find(candidates(user, for_visibility=for_visibility), {'name': 1, 'username': 1}).sort('name', 1)]
 
 
-def validate_assignees(database, user, values):
+def validate_assignees(database, user, values, *, for_visibility=False):
     if len(set(values)) != len(values) or database.users.count_documents({
-        **candidates(user), '_id': {'$in': values},
+        **candidates(user, for_visibility=for_visibility), '_id': {'$in': values},
     }) != len(values):
         raise HTTPException(422, 'گیرندگان باید فعال، یکتا و در محدودهٔ مجاز ارجاع باشند.')
 
@@ -133,14 +154,16 @@ def fetch_task(database, user, task_id):
 def task_view(task, user, names, include_comments=False):
     identity = user['_id']
     supervisor = is_supervisor(user, task['board'])
-    write = allowed(user, 'tasks', write=True)
+    write = allowed(user, 'tasks', write=True) or (
+        'tasks' not in user.get('permissions', {}) and identity in task['assignees'])
     assignees = task['assignees']
     restricted = task['board'] == CENTRAL and user['role'] != 'manager'
     if restricted:
         assignees = [identity] if identity in assignees else []
     item = {key: task[key] for key in ('title', 'priority', 'column_id', 'created_at', 'closed_at', 'revision')}
     item.update(
-        id=task['_id'], description=task['description'],
+        id=task['_id'], description=task['description'], tags=task.get('tags') or [],
+        updated_by=editor_name(task, user, names),
         creator=names.get(task['creator'], '—'),
         assignees=[{'id': key, 'name': names.get(key, '—')} for key in assignees],
         comment_count=task['comment_count'],
@@ -157,10 +180,17 @@ def task_view(task, user, names, include_comments=False):
     return item
 
 
+def editor_name(task, user, names):
+    editor = task.get('updated_by', task['creator'])
+    if task['board'] == CENTRAL and user['role'] != 'manager' and editor not in {user['_id'], task['creator']}:
+        return 'ادمین'
+    return names.get(editor, '—')
+
+
 def task_names(database, tasks):
     ids = set()
     for task in tasks:
-        ids.add(task['creator'])
+        ids.update([task['creator'], task.get('updated_by', task['creator'])])
         ids.update(task['assignees'])
         ids.update(comment['author'] for comment in task.get('comments', ()))
     return {row['_id']: row['name'] for row in database.users.find({'_id': {'$in': list(ids)}}, {'name': 1})}
@@ -196,10 +226,12 @@ def list_tasks(user: User, database: DB, response: Response, board: Identifier,
 
 @router.post('/tasks', status_code=201)
 def create_task(body: NewTask, user: User, database: DB):
+    if not allowed(user, 'tasks', write=True):
+        raise HTTPException(403, 'اجازهٔ ایجاد تسک را ندارید.')
     board = own_board(user)
     board_scope(user, board, database)
     validate_assignees(database, user, body.assignees)
-    task = {'_id': uuid4().hex, **body.model_dump(), 'board': board, 'creator': user['_id'],
+    task = {'_id': uuid4().hex, **body.model_dump(), 'board': board, 'creator': user['_id'], 'updated_by': user['_id'],
             'column_id': 'todo', 'created_at': now(), 'closed_at': None, 'comments': [], 'comment_count': 0, 'revision': 0}
     database.tasks.insert_one(task)
     return task_view(task, user, task_names(database, [task]))
@@ -219,7 +251,7 @@ def update_task(task_id: Identifier, body: TaskUpdate, user: User, database: DB)
     changes = body.model_dump(exclude_none=True, exclude={'revision'})
     if not changes:
         raise HTTPException(422, 'تغییری وارد نشده است.')
-    if not view['can_move'] or (('assignees' in changes or 'priority' in changes) and not view['can_assign']):
+    if not view['can_move'] or (({'assignees', 'priority', 'tags'} & changes.keys()) and not view['can_assign']):
         raise HTTPException(403, 'اجازهٔ تغییر تسک را ندارید.')
     if body.assignees is not None:
         validate_assignees(database, user, body.assignees)
@@ -228,6 +260,7 @@ def update_task(task_id: Identifier, body: TaskUpdate, user: User, database: DB)
             raise HTTPException(422, 'ستون مقصد در این تابلو وجود ندارد.')
         if body.column_id == DONE:
             changes['closed_at'] = now()
+    changes['updated_by'] = user['_id']
     updated = database.tasks.find_one_and_update(
         {'_id': task_id, 'revision': body.revision, 'closed_at': None, **scope},
         {'$set': changes, '$inc': {'revision': 1}}, return_document=ReturnDocument.AFTER)
@@ -238,10 +271,12 @@ def update_task(task_id: Identifier, body: TaskUpdate, user: User, database: DB)
 
 @router.post('/tasks/{task_id}/comments', status_code=201)
 def add_comment(task_id: Identifier, body: Comment, user: User, database: DB):
-    _, _, scope = fetch_task(database, user, task_id)
+    task, _, scope = fetch_task(database, user, task_id)
+    if not task_view(task, user, {})['can_comment']:
+        raise HTTPException(403, 'اجازهٔ ثبت کامنت را ندارید.')
     comment = {'id': uuid4().hex, 'text': body.text, 'author': user['_id'], 'created_at': now()}
     updated = database.tasks.find_one_and_update({'_id': task_id, 'comments.199': {'$exists': False}, **scope},
-        {'$push': {'comments': comment}, '$inc': {'comment_count': 1}}, return_document=ReturnDocument.AFTER)
+        {'$push': {'comments': comment}, '$inc': {'comment_count': 1}, '$set': {'updated_by': user['_id']}}, return_document=ReturnDocument.AFTER)
     if not updated:
         raise HTTPException(409, 'تسک تغییر کرده یا به سقف ۲۰۰ کامنت رسیده است.')
     return task_view(updated, user, task_names(database, [updated]), include_comments=True)
@@ -257,7 +292,7 @@ def column_board(user):
 def list_columns(user: User, database: DB):
     board = column_board(user)
     return {'items': columns(database, board), 'allow_branch': board != CENTRAL,
-            'members': member_options(database, user) if board != CENTRAL else []}
+            'members': member_options(database, user, for_visibility=True) if board != CENTRAL else []}
 
 
 def save_column(body, user, database, column_id=None):
@@ -270,7 +305,7 @@ def save_column(body, user, database, column_id=None):
     if body.audience == 'selected':
         if not body.viewers:
             raise HTTPException(422, 'حداقل یک مشاهده‌کننده انتخاب کنید.')
-        validate_assignees(database, user, body.viewers)
+        validate_assignees(database, user, body.viewers, for_visibility=True)
     elif body.viewers:
         raise HTTPException(422, 'فهرست مشاهده‌کنندگان فقط برای حالت انتخاب اعضا مجاز است.')
     identity = column_id or uuid4().hex

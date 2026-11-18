@@ -11,7 +11,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.db.session import DB
-from app.services.access import (COOKIE, SECTIONS, SESSION_SECONDS, allowed, now,
+from app.services.access import (COOKIE, SECTIONS, SESSION_SECONDS, allowed, has_task_assignment, now,
                                  password_hash, password_matches, public_user, token_digest)
 
 router = APIRouter(prefix='/api/v1', tags=['Access'])
@@ -68,6 +68,9 @@ def authorize(request: Request):
     if path in SESSION_ONLY:
         return
     section = EXACT.get(path) or PREFIX.get(path.removeprefix('/api/v1/').split('/')[0])
+    if section == 'tasks' and 'tasks' not in user.get('permissions', {}) and user['role'] != 'manager':
+        if has_task_assignment(request.app.state.database, user):
+            return
     if not section or not allowed(user, section, write):
         raise HTTPException(403, 'دسترسی به این بخش یا عملیات مجاز نیست.')
 
@@ -174,7 +177,7 @@ def login(body: Login, request: Request, response: Response, database: DB):
     response.set_cookie(COOKIE, token, max_age=SESSION_SECONDS, httponly=True,
                         secure=request.app.state.settings.session_cookie_secure, samesite='strict')
     response.headers['Cache-Control'] = 'no-store'
-    return public_user(user)
+    return session_view(user, database)
 
 
 @router.post('/auth/logout')
@@ -188,9 +191,13 @@ def logout(request: Request, response: Response, database: DB):
 
 
 @router.get('/auth/me')
-def me(user: User, response: Response):
+def me(user: User, response: Response, database: DB):
     response.headers['Cache-Control'] = 'no-store'
-    return public_user(user)
+    return session_view(user, database)
+
+
+def session_view(user, database):
+    return {**public_user(user), 'task_access': allowed(user, 'tasks') or has_task_assignment(database, user)}
 
 
 @router.patch('/auth/branch')
