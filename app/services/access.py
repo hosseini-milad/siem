@@ -36,10 +36,15 @@ def token_digest(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def avatar_url(user):
+    token = user.get('avatar_token')
+    return f'/api/v1/auth/avatars/{token}' if token else None
+
+
 def public_user(user):
     return {'id': user['_id'], **{key: user[key] for key in ('username', 'name', 'role', 'active')},
             'device_id': user.get('device_id'), 'permissions': user.get('permissions', {}),
-            'branch': user.get('branch', ''), 'system': user.get('system')}
+            'branch': user.get('branch', ''), 'system': user.get('system'), 'avatar_url': avatar_url(user)}
 
 
 def allowed(user, section, write=False):
@@ -55,9 +60,11 @@ def visible_task_lifetime():
 
 def initialize_access(database):
     database.users.create_index('username', unique=True)
+    database.users.create_index('avatar_token', unique=True, sparse=True)
     database.users.create_index('device_id', unique=True, partialFilterExpression={'device_id': {'$type': 'string'}})
     database.users.create_index([('role', 1), ('created_by', 1), ('username', 1)])
     database.tasks.create_index([('board', 1), ('created_at', -1), ('_id', 1)])
+    database.tasks.create_index([('column_id', 1), ('created_at', -1), ('_id', 1)])
     database.tasks.create_index([('assignees', 1), ('closed_at', 1)])
     database.task_columns.create_index('board')
     database.sessions.create_index('expires_at', expireAfterSeconds=0)

@@ -1,5 +1,6 @@
 import re
 import secrets
+from io import BytesIO
 from ipaddress import ip_address
 from datetime import timedelta
 from typing import Annotated, Literal
@@ -7,6 +8,8 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from PIL import Image, ImageOps
+from starlette.concurrency import run_in_threadpool
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -22,7 +25,7 @@ Section = Literal['overview', 'ingestion', 'events', 'explorer', 'detections', '
 Grants = dict[Section, Literal['read', 'write']]
 
 PUBLIC = {'/api/v1/health', '/api/v1/auth/login', '/api/v1/auth/logout'}
-SESSION_ONLY = {'/api/v1/auth/me', '/api/v1/auth/branch', '/api/v1/system/navigation'}
+SESSION_ONLY = {'/api/v1/auth/me', '/api/v1/auth/branch', '/api/v1/auth/avatar', '/api/v1/auth/avatars/{token}', '/api/v1/system/navigation'}
 EXACT = {
     '/dashboard': 'overview',
     '/api/v1/ml/model': 'current-model',
@@ -44,7 +47,7 @@ def get_user(request: Request):
     database = request.app.state.database
     session = database.sessions.find_one({'_id': token_digest(token), 'expires_at': {'$gt': now()}})
     user = session and database.users.find_one({'_id': session['user_id'], 'active': True,
-                                               'session_version': session['session_version']})
+                                               'session_version': session['session_version']}, {'avatar_data': 0})
     if not user:
         raise HTTPException(401, 'نشست معتبر نیست. دوباره وارد شوید.')
     return user
@@ -195,6 +198,47 @@ def me(user: User, response: Response):
     return session_view(user)
 
 
+def avatar_thumbnail(data):
+    try:
+        with Image.open(BytesIO(data), formats=['JPEG', 'PNG', 'WEBP']) as source:
+            if source.width * source.height > 16_000_000 or max(source.size) > 8192:
+                raise ValueError('Image dimensions too large')
+            source.thumbnail((192, 192))
+            image = ImageOps.exif_transpose(source).convert('RGBA')
+            output = BytesIO()
+            image.save(output, format='WEBP', quality=82)
+            return output.getvalue()
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise HTTPException(422, 'تصویر معتبر JPEG، PNG یا WebP انتخاب کنید.') from exc
+
+
+@router.put('/auth/avatar')
+async def upload_avatar(request: Request, user: User, database: DB):
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > 2 * 1024 * 1024:
+            raise HTTPException(413, 'حجم تصویر نباید بیشتر از ۲ مگابایت باشد.')
+        data.extend(chunk)
+    image = await run_in_threadpool(avatar_thumbnail, data)
+    updated = await run_in_threadpool(
+        database.users.find_one_and_update,
+        {'_id': user['_id'], 'active': True, 'session_version': user['session_version']},
+        {'$set': {'avatar_token': uuid4().hex, 'avatar_data': image}},
+        projection={'avatar_data': 0}, return_document=ReturnDocument.AFTER)
+    if not updated:
+        raise HTTPException(401, 'نشست معتبر نیست.')
+    return session_view(updated)
+
+
+@router.get('/auth/avatars/{token}')
+def get_avatar(token: Annotated[str, Field(pattern=r'^[a-f0-9]{32}$')], user: User, database: DB):
+    avatar = database.users.find_one({'avatar_token': token}, {'avatar_data': 1})
+    if not avatar:
+        raise HTTPException(404, 'تصویر پیدا نشد.')
+    return Response(avatar['avatar_data'], media_type='image/webp',
+                    headers={'Cache-Control': 'private, max-age=3600', 'X-Content-Type-Options': 'nosniff'})
+
+
 def session_view(user):
     return {**public_user(user), 'task_access': True}
 
@@ -220,7 +264,7 @@ def with_branches(database, rows):
 
 
 def account_page(database, scope, limit, offset):
-    rows = list(database.users.find(scope).sort([('created_by', 1), ('username', 1)]).skip(offset).limit(limit))
+    rows = list(database.users.find(scope, {'avatar_data': 0}).sort([('created_by', 1), ('username', 1)]).skip(offset).limit(limit))
     return {'items': with_branches(database, rows), 'total': database.users.count_documents(scope),
             'limit': limit, 'offset': offset}
 

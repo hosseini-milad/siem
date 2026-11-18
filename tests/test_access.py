@@ -254,3 +254,44 @@ def test_task_assignment_without_menu_privilege_and_expiration(application):
     assert admin.get(item).status_code == 404
     assert app.state.database.tasks.find_one({'_id': task.json()['id']}) is not None
     assert client.get('/api/v1/auth/me').json()['task_access'] is True
+
+
+def test_avatar_and_independent_column_cursor(application):
+    from io import BytesIO
+
+    from PIL import Image
+
+    manager, app = application
+    assert login(manager, 'manager').status_code == 200
+    raw = BytesIO()
+    Image.new('RGB', (300, 100), 'green').save(raw, format='PNG')
+    path = '/api/v1/auth/avatar'
+    assert manager.put(path, content=b'<svg/>').status_code == 422
+    assert manager.put(path, content=b'x' * (2 * 1024 * 1024 + 1)).status_code == 413
+    uploaded = manager.put(path, content=raw.getvalue(), headers={'Content-Type': 'image/png'})
+    assert uploaded.status_code == 200, uploaded.text
+    url = uploaded.json()['avatar_url']
+    assert manager.get('/api/v1/auth/me').json()['avatar_url'] == url
+    image = manager.get(url)
+    assert image.headers['content-type'] == 'image/webp'
+    assert Image.open(BytesIO(image.content)).size == (192, 64)
+    assert TestClient(app, base_url='https://testserver').get(url).status_code == 401
+
+    path = '/api/v1/tasks'
+    tasks = []
+    for index in range(7):
+        response = manager.post(path, json={'title': f'Item {index}', 'assignees': ['manager']})
+        assert response.status_code == 201
+        assert response.json()['assignees'][0]['avatar_url'] == url
+        tasks.append(response.json()['id'])
+    assert manager.patch(path + '/' + tasks[0], json={'revision': 0, 'column_id': 'doing'}).status_code == 200
+    metadata = manager.get(path, params={'metadata_only': True}).json()
+    assert metadata['items'] == [] and metadata['columns']
+    params = {'column_id': 'todo', 'limit': 5}
+    first = manager.get(path, params=params).json()
+    assert len(first['items']) == 5 and first['total'] == 6
+    second = manager.get(path, params={**params, 'before': first['next_cursor']}).json()
+    assert second['next_cursor'] is None and len(second['items']) == 1
+    assert {row['id'] for page in (first, second) for row in page['items']} == set(tasks[1:])
+    running = manager.get(path, params={'column_id': 'doing', 'limit': 5}).json()
+    assert [row['id'] for row in running['items']] == tasks[:1]

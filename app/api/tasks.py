@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -7,7 +8,7 @@ from pymongo import ReturnDocument
 
 from app.api.access import User
 from app.db.session import DB
-from app.services.access import allowed, now, visible_task_lifetime
+from app.services.access import allowed, avatar_url, now, visible_task_lifetime
 
 router = APIRouter(prefix='/api/v1', tags=['Tasks'])
 CENTRAL = 'central'
@@ -167,8 +168,8 @@ def task_view(task, user, names, include_comments=False):
     item.update(
         id=task['_id'], description=task['description'], tags=task.get('tags') or [],
         updated_by=editor_name(task, user, names),
-        creator=names.get(task['creator'], '—'),
-        assignees=[{'id': key, 'name': names.get(key, '—')} for key in assignees],
+        creator=person_name(names, task['creator']),
+        assignees=[{'id': key, 'name': person_name(names, key), 'avatar_url': avatar_url(names.get(key, {}))} for key in assignees],
         comment_count=task['comment_count'],
         can_comment=supervisor or participates or allowed(user, 'tasks', write=True),
         can_move=can_move,
@@ -177,7 +178,7 @@ def task_view(task, user, names, include_comments=False):
     if include_comments:
         item['comments'] = [{**comment, 'author': (
             'ادمین' if restricted and comment['author'] not in {identity, task['creator']}
-            else names.get(comment['author'], '—'))} for comment in task['comments']]
+            else person_name(names, comment['author']))} for comment in task['comments']]
     return item
 
 
@@ -185,7 +186,11 @@ def editor_name(task, user, names):
     editor = task.get('updated_by', task['creator'])
     if task['board'] == CENTRAL and user['role'] != 'manager' and editor not in {user['_id'], task['creator']}:
         return 'ادمین'
-    return names.get(editor, '—')
+    return person_name(names, editor)
+
+
+def person_name(people, identity):
+    return people.get(identity, {}).get('name', '—')
 
 
 def task_names(database, tasks):
@@ -194,7 +199,7 @@ def task_names(database, tasks):
         ids.update([task['creator'], task.get('updated_by', task['creator'])])
         ids.update(task['assignees'])
         ids.update(comment['author'] for comment in task.get('comments', ()))
-    return {row['_id']: row['name'] for row in database.users.find({'_id': {'$in': list(ids)}}, {'name': 1})}
+    return {row['_id']: row for row in database.users.find({'_id': {'$in': list(ids)}}, {'name': 1, 'avatar_token': 1})}
 
 
 @router.get('/tasks/boards')
@@ -222,7 +227,9 @@ def historical_tags(database, scope):
 
 @router.get('/tasks')
 def list_tasks(user: User, database: DB, response: Response, board: Identifier | None = None,
-               offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=100)):
+               offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=100),
+               column_id: Identifier | None = None, metadata_only: bool = False,
+               before: str | None = Query(None, pattern=r'^\d{1,13}:[a-f0-9]{32}$')):
     own = own_board(user)
     if board is not None:
         board_scope(user, board, database)
@@ -231,7 +238,22 @@ def list_tasks(user: User, database: DB, response: Response, board: Identifier |
         board_ids = [item['id'] for item in boards(user, database)['items']]
     by_board = {identity: columns(database, identity) for identity in board_ids}
     scope = {'$or': [visible_tasks(user, identity, stages) for identity, stages in by_board.items()]}
-    rows = list(database.tasks.find(scope, {'comments': 0}).sort([('created_at', -1), ('_id', 1)]).skip(offset).limit(limit))
+    if column_id is not None:
+        scope['column_id'] = column_id
+    window = scope
+    if before:
+        milliseconds, identity = before.split(':')
+        instant = datetime.fromtimestamp(int(milliseconds) / 1000, timezone.utc)
+        window = {'$and': [scope, {'$or': [{'created_at': {'$lt': instant}},
+            {'created_at': instant, '_id': {'$gt': identity}}]}]}
+    rows = [] if metadata_only else list(database.tasks.find(window, {'comments': 0})
+        .sort([('created_at', -1), ('_id', 1)]).skip(offset).limit(limit + 1))
+    next_cursor = None
+    if len(rows) > limit:
+        rows.pop()
+        last = rows[-1]
+        next_cursor = f"{round(last['created_at'].timestamp() * 1000)}:{last['_id']}"
+
     names = task_names(database, rows)
     can_create = own in by_board
     visible_columns = {}
@@ -242,10 +264,13 @@ def list_tasks(user: User, database: DB, response: Response, board: Identifier |
         'move_columns': [stage['id'] for stage in by_board[task['board']]],
     } for task in rows]
     response.headers['Cache-Control'] = 'no-store'
+    if column_id is not None:
+        return {'items': cards, 'next_cursor': next_cursor,
+                'total': database.tasks.count_documents(scope) if before is None else None}
     tag_scope = {'$or': [visible_tasks(user, identity, stages, include_history=True)
                         for identity, stages in by_board.items()]}
     return {'items': cards, 'columns': sorted(visible_columns.values(), key=lambda stage: (stage['position'], stage['id'])),
-            'total': database.tasks.count_documents(scope), 'offset': offset, 'limit': limit,
+            'total': 0 if metadata_only else database.tasks.count_documents(scope), 'offset': offset, 'limit': limit,
             'tag_suggestions': historical_tags(database, tag_scope) if can_create else [],
             'can_create': can_create, 'assignees': member_options(database, user) if can_create else []}
 
