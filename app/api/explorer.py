@@ -24,7 +24,7 @@ class ExplorerFilters(BaseModel):
     destination_port: int | None = Field(None, ge=0, le=65535)
     protocol: Literal['TCP', 'UDP', 'ICMP'] | None = None
     level: LogLevel | None = None
-    risk: Literal['low', 'medium', 'high', 'critical', 'unscored'] | None = None
+    risk: Literal['benign', 'low', 'medium', 'high', 'critical', 'attack', 'unscored'] | None = None
     limit: int = Field(15, ge=1, le=100)
     offset: int = Field(0, ge=0)
 

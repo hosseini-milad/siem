@@ -10,10 +10,12 @@ MAX_CANDIDATES = 1_000
 DATASET_ORDER = [('Timestamp', -1), ('_id', -1)]
 LOG_ORDER = [('timestamp', -1), ('_id', -1)]
 RISK_BANDS = {
-    'low': {'$gte': 0, '$lt': .35},
+    'benign': {'$eq': 0},
+    'low': {'$gt': 0, '$lt': .35},
     'medium': {'$gte': .35, '$lt': .65},
     'high': {'$gte': .65, '$lt': .85},
-    'critical': {'$gte': .85, '$lte': 1},
+    'critical': {'$gte': .85, '$lt': 1},
+    'attack': {'$eq': 1},
 }
 
 
@@ -81,10 +83,24 @@ def indexed_dataset_window(start, end):
 def log_fields():
     return [{'$project': {
         'raw': '$$ROOT', 'timestamp': 1, 'source': 1, 'level': 1, 'message': 1,
+        'label': {'$ifNull': ['$Label', '$attributes.Label', '$attributes.label', None]},
         'source_ip': '$attributes.source_ip', 'destination_ip': '$attributes.destination_ip',
         'source_port': '$attributes.source_port', 'protocol': '$attributes.protocol',
         'destination_port': {'$ifNull': ['$attributes.destination_port', '$attributes.port', None]},
     }}, {'$unset': 'raw._search_index'}]
+
+
+def label_score():
+    text = {'$toLower': {'$trim': {'input': {'$ifNull': [convert('$label', 'string'), '']}}}}
+    return {'$let': {'vars': {'text': text}, 'in': {'$switch': {
+        'branches': [
+            {'case': {'$in': ['$$text', ['benign', 'normal']]}, 'then': 0},
+            {'case': {'$eq': ['$$text', 'attack']}, 'then': 1},
+        ],
+        'default': {'$let': {'vars': {'score': convert('$$text', 'double')}, 'in': {'$cond': [
+            {'$and': [{'$gte': ['$$score', 0]}, {'$lte': ['$$score', 1]}]}, '$$score', None,
+        ]}}},
+    }}}}
 
 
 def lookup(collection, alias):
@@ -105,6 +121,7 @@ def list_records(database, filters):
         pipeline = candidates + candidate_limit + dataset_fields() + date_match
     protocol = {'$toUpper': {'$ifNull': [convert('$protocol', 'string'), '']}}
     pipeline.append({'$set': {
+        'risk_score': label_score(),
         'source_port': convert('$source_port', 'int'), 'destination_port': convert('$destination_port', 'int'),
         'protocol': {'$switch': {'branches': [
             {'case': {'$eq': [protocol, code]}, 'then': name}
@@ -123,22 +140,13 @@ def list_records(database, filters):
     if criteria:
         pipeline.append({'$match': criteria})
     if filters.risk:
-        if logs and filters.risk != 'unscored':
-            return {'items': [], 'total': 0, 'limit': filters.limit, 'offset': filters.offset}
-        if not logs:
-            pipeline.append(lookup('ml_predictions', 'prediction'))
-            band = RISK_BANDS.get(filters.risk)
-            predicate = {'$elemMatch': {'attack_probability': band}} if band else {
-                '$not': {'$elemMatch': {'attack_probability': {'$gte': 0, '$lte': 1}}}}
-            pipeline.append({'$match': {'prediction': predicate}})
+        pipeline.append({'$match': {'risk_score': RISK_BANDS.get(filters.risk)}})
 
     count = next(collection.aggregate([*pipeline, {'$count': 'total'}], maxTimeMS=TIMEOUT_MS), {'total': 0})
     rows_pipeline = [*pipeline, {'$sort': {'timestamp': -1, '_id': -1}},
                      {'$skip': filters.offset}, {'$limit': filters.limit}]
     if not logs:
         rows_pipeline.append(lookup('normal_records', 'normalized'))
-        if not filters.risk:
-            rows_pipeline.append(lookup('ml_predictions', 'prediction'))
     rows = collection.aggregate(rows_pipeline, maxTimeMS=TIMEOUT_MS, allowDiskUse=True)
     return {'items': [public_record(row) for row in rows], **count, 'limit': filters.limit, 'offset': filters.offset}
 
@@ -146,11 +154,15 @@ def list_records(database, filters):
 def public_record(row):
     output = {key: row.get(key) for key in ('timestamp', 'source', 'level', 'message', 'source_ip',
                                             'destination_ip', 'source_port', 'destination_port', 'protocol', 'raw')}
-    prediction = next(iter(row.get('prediction', [])), {})
-    probability = prediction.get('attack_probability')
+    score = row.get('risk_score')
     risk = None
-    if isinstance(probability, (int, float)) and 0 <= probability <= 1:
-        severity = next(name for name, band in reversed(RISK_BANDS.items()) if probability >= band['$gte'])
-        risk = {'attack_probability': probability, 'severity': severity,
-                'predicted_at': prediction.get('predicted_at')}
+    if score is not None:
+        if score == 0:
+            severity = 'benign'
+        elif score == 1:
+            severity = 'attack'
+        else:
+            severity = next(name for name in ('critical', 'high', 'medium', 'low')
+                            if score >= RISK_BANDS[name].get('$gte', 0))
+        risk = {'score': score, 'severity': severity}
     return {**output, 'id': str(row['_id']), 'normalized': next(iter(row.get('normalized', [])), None), 'risk': risk}
