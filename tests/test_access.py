@@ -85,3 +85,48 @@ def test_roles_grants_and_session_revocation(application):
     assert client.post('/api/v1/auth/logout').status_code == 200
     assert not app.state.database.sessions.find_one({'_id': token_digest(token)})
     assert client.get('/api/v1/auth/me').status_code == 401
+
+
+def test_branch_hierarchy_and_system_profiles(application):
+    manager, app = application
+    login(manager, 'manager')
+    operators = []
+    endpoints = []
+    for branch in ('east', 'west'):
+        registered = manager.post('/api/v1/users', json={
+            'username': branch, 'name': branch, 'password': PASSWORD, 'branch': branch,
+            'permissions': {'users': 'write', 'device-health': 'write'},
+        })
+        assert registered.status_code == 201, registered.text
+        operator = TestClient(app, base_url='https://testserver')
+        assert login(operator, branch).status_code == 200
+        operators.append(operator)
+        created = operator.post('/api/v1/users', json={
+            'username': branch + '-host', 'name': 'Host', 'password': PASSWORD,
+            'system': {'ip': '2001:0DB8::1', 'mac': 'AA-BB-CC-DD-EE-FF', 'type': 'server'},
+        })
+        assert created.status_code == 201, created.text
+        endpoints.append(created.json()['id'])
+        assert created.json()['system']['ip'] == '2001:db8::1'
+        assert created.json()['system']['mac'] == 'aa:bb:cc:dd:ee:ff'
+
+    east, west = endpoints
+    operator = operators[0]
+    assert operator.patch('/api/v1/auth/branch', json={'branch': 'Eastern office'}).status_code == 200
+    assert [row['id'] for row in operator.get('/api/v1/users').json()['items']] == [east]
+    assert [row['id'] for row in operator.get('/api/v1/device-health').json()['items']] == [east]
+    profile = {'name': 'Host A', 'ip': '192.0.2.1', 'type': 'server', 'threshold': 75}
+    assert operator.patch(f'/api/v1/device-health/{west}', json=profile).status_code == 404
+    assert operator.patch(f'/api/v1/users/{west}', json={'name': 'Unauthorized'}).status_code == 404
+    invalid = operator.patch(f'/api/v1/device-health/{east}', json={**profile, 'mac': 'invalid'})
+    assert invalid.status_code == 422
+    assert operator.patch(f'/api/v1/device-health/{east}', json=profile).status_code == 200
+    assert operator.patch(f'/api/v1/users/{east}', json={'name': 'Updated', 'username': 'new-host'}).status_code == 200
+    rows = {row['id']: row for row in manager.get('/api/v1/device-health').json()['items']}
+    assert rows[east]['branch'] == 'Eastern office' and rows[west]['branch'] == 'west'
+    assert rows[east]['system']['threshold'] == 75 and rows[east]['username'] == 'new-host'
+    assert manager.patch(f'/api/v1/users/{east}', json={'permissions': {'device-health': 'read'}}).status_code == 200
+    client = TestClient(app, base_url='https://testserver')
+    assert login(client, 'new-host').status_code == 200
+    assert [row['id'] for row in client.get('/api/v1/device-health').json()['items']] == [east]
+    assert client.patch(f'/api/v1/device-health/{east}', json=profile).status_code == 403

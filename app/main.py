@@ -95,7 +95,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
-        if request.url.path.startswith(('/api/v1/auth/', '/api/v1/users')):
+        if request.url.path.startswith(('/api/v1/auth/', '/api/v1/users', '/api/v1/device-health')):
             return JSONResponse(status_code=422, content={"detail": "مقادیر فرم معتبر نیستند."})
         return await request_validation_exception_handler(request, exc)
 

@@ -38,7 +38,8 @@ def token_digest(token):
 
 def public_user(user):
     return {'id': user['_id'], **{key: user[key] for key in ('username', 'name', 'role', 'active')},
-            'device_id': user.get('device_id'), 'permissions': user.get('permissions', {})}
+            'device_id': user.get('device_id'), 'permissions': user.get('permissions', {}),
+            'branch': user.get('branch', ''), 'system': user.get('system')}
 
 
 def allowed(user, section, write=False):
@@ -51,5 +52,6 @@ def allowed(user, section, write=False):
 def initialize_access(database):
     database.users.create_index('username', unique=True)
     database.users.create_index('device_id', unique=True, partialFilterExpression={'device_id': {'$type': 'string'}})
+    database.users.create_index([('role', 1), ('created_by', 1), ('username', 1)])
     database.sessions.create_index('expires_at', expireAfterSeconds=0)
     database.login_attempts.create_index('expires_at', expireAfterSeconds=0)

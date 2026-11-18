@@ -1,10 +1,12 @@
+import re
 import secrets
+from ipaddress import ip_address
 from datetime import timedelta
 from typing import Annotated, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -20,7 +22,7 @@ Section = Literal['overview', 'ingestion', 'events', 'explorer', 'detections', '
 Grants = dict[Section, Literal['read', 'write']]
 
 PUBLIC = {'/api/v1/health', '/api/v1/auth/login', '/api/v1/auth/logout'}
-SESSION_ONLY = {'/api/v1/auth/me', '/api/v1/system/navigation'}
+SESSION_ONLY = {'/api/v1/auth/me', '/api/v1/auth/branch', '/api/v1/system/navigation'}
 EXACT = {
     '/dashboard': 'overview',
     '/api/v1/ml/model': 'current-model',
@@ -31,7 +33,7 @@ PREFIX = {
     'overview': 'overview', 'dashboard': 'overview', 'logs': 'ingestion', 'ingestion': 'ingestion',
     'search': 'events', 'explorer': 'explorer', 'detections': 'detections', 'alerts': 'alerts',
     'incidents': 'incidents', 'datasets': 'analytics', 'normalization': 'analytics',
-    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'users': 'users',
+    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'users': 'users', 'device-health': 'device-health',
 }
 
 
@@ -83,6 +85,45 @@ class Login(BaseModel):
     password: Annotated[SecretStr, Field(min_length=1, max_length=128)]
 
 
+Text = Annotated[str, Field(max_length=100)]
+Name = Annotated[str, Field(min_length=1, max_length=100)]
+
+
+class SystemProfile(BaseModel):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    name: Text = ''
+    ip: Annotated[str, Field(max_length=45)] = ''
+    mac: Annotated[str, Field(max_length=17)] = ''
+    type: Literal['desktop', 'laptop', 'server', 'other'] = 'desktop'
+    os: Text = ''
+    processor: Text = ''
+    memory: Text = ''
+    storage: Text = ''
+    threshold: int = Field(default=70, ge=1, le=100)
+
+    @field_validator('ip')
+    @classmethod
+    def normalize_ip(cls, value):
+        if '%' in value:
+            raise ValueError('IP scope identifiers are unsupported')
+        return str(ip_address(value)) if value else ''
+
+    @field_validator('mac')
+    @classmethod
+    def normalize_mac(cls, value):
+        if not value:
+            return ''
+        if not re.fullmatch(r'[0-9a-f]{12}|(?:[0-9a-f]{2}:){5}[0-9a-f]{2}|(?:[0-9a-f]{2}-){5}[0-9a-f]{2}', value, re.I):
+            raise ValueError('Invalid MAC address')
+        digits = value.lower().replace(':', '').replace('-', '')
+        return ':'.join(digits[i:i+2] for i in range(0, 12, 2))
+
+
+class BranchUpdate(BaseModel):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    branch: Name
+
+
 class NewUser(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     username: Username
@@ -90,10 +131,16 @@ class NewUser(BaseModel):
     password: Password
     device_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9_-]{1,100}$')
     permissions: Grants | None = None
+    branch: Name | None = None
+    system: SystemProfile | None = None
 
 
 class UserUpdate(BaseModel):
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
+    name: Name | None = None
+    username: Username | None = None
+    branch: Name | None = None
+    system: SystemProfile | None = None
     active: bool | None = None
     permissions: Grants | None = None
 
@@ -146,6 +193,59 @@ def me(user: User, response: Response):
     return public_user(user)
 
 
+@router.patch('/auth/branch')
+def update_branch(body: BranchUpdate, user: User, database: DB):
+    if user['role'] != 'admin':
+        raise HTTPException(403, 'فقط ادمین می‌تواند نام شاخهٔ خودش را تنظیم کند.')
+    updated = database.users.find_one_and_update({'_id': user['_id'], 'role': 'admin'},
+                                                 {'$set': {'branch': body.branch}},
+                                                 return_document=ReturnDocument.AFTER)
+    return public_user(updated)
+
+
+def with_branches(database, rows):
+    owners = {row.get('created_by') for row in rows if row['role'] == 'client'}
+    branches = {owner['_id']: owner.get('branch', '') for owner in
+                database.users.find({'_id': {'$in': list(owners)}, 'role': 'admin'}, {'branch': 1})} if owners else {}
+    return [public_user(row) | {
+        'branch': branches.get(row.get('created_by'), '') if row['role'] == 'client' else row.get('branch', ''),
+        'branch_id': row.get('created_by') if row['role'] == 'client' else row['_id'],
+    } for row in rows]
+
+
+def account_page(database, scope, limit, offset):
+    rows = list(database.users.find(scope).sort([('created_by', 1), ('username', 1)]).skip(offset).limit(limit))
+    return {'items': with_branches(database, rows), 'total': database.users.count_documents(scope),
+            'limit': limit, 'offset': offset}
+
+
+def device_scope(user):
+    if user['role'] == 'manager':
+        return {'role': 'client'}
+    if user['role'] == 'admin':
+        return {'role': 'client', 'created_by': user['_id']}
+    return {'role': 'client', '_id': user['_id']}
+
+
+@router.get('/device-health')
+def device_health(user: User, database: DB, response: Response,
+                  limit: int = Query(25, ge=1, le=100), offset: int = Query(0, ge=0)):
+    response.headers['Cache-Control'] = 'no-store'
+    return account_page(database, device_scope(user), limit, offset)
+
+
+@router.patch('/device-health/{user_id}')
+def update_device(user_id: str, body: SystemProfile, user: User, database: DB):
+    if user['role'] == 'client':
+        raise HTTPException(403, 'ویرایش سیستم مجاز نیست.')
+    updated = database.users.find_one_and_update(
+        {'_id': user_id, **device_scope(user)}, {'$set': {'system': body.model_dump()}},
+        return_document=ReturnDocument.AFTER)
+    if not updated:
+        raise HTTPException(404, 'سیستم پیدا نشد.')
+    return with_branches(database, [updated])[0]
+
+
 def account_scope(user):
     if user['role'] == 'manager':
         return {'role': {'$in': ['admin', 'client']}}
@@ -160,10 +260,8 @@ def users(user: User, database: DB, response: Response,
     if not allowed(user, 'users'):
         raise HTTPException(403, 'دسترسی به کاربران مجاز نیست.')
     scope = account_scope(user)
-    items = database.users.find(scope).sort('username', 1).skip(offset).limit(limit)
     response.headers['Cache-Control'] = 'no-store'
-    return {'items': [public_user(item) for item in items], 'total': database.users.count_documents(scope),
-            'limit': limit, 'offset': offset}
+    return account_page(database, scope, limit, offset)
 
 
 @router.post('/users', status_code=201)
@@ -174,12 +272,19 @@ def create_user(body: NewUser, user: User, database: DB):
     manager = user['role'] == 'manager'
     if not manager and body.permissions is not None:
         raise HTTPException(403, 'فقط مدیریت کل دسترسی‌ها را تعیین می‌کند.')
-    if manager == bool(body.device_id):
-        raise HTTPException(422, 'اتصال به سیستم فقط برای حساب کلاینت الزامی است.')
-    doc = {'_id': uuid4().hex, 'username': body.username.lower(), 'name': body.name,
+    if manager and (body.device_id or body.system is not None) or not manager and body.branch is not None:
+        raise HTTPException(422, 'شاخه برای ادمین و مشخصات سیستم برای کلاینت تعریف می‌شود.')
+    if not manager and body.system is None and not body.device_id:
+        raise HTTPException(422, 'مشخصات سیستم یا شناسهٔ اتصال کلاینت را وارد کنید.')
+    identity = uuid4().hex
+    doc = {'_id': identity, 'username': body.username.lower(), 'name': body.name,
            'password': password_hash(body.password.get_secret_value()), 'role': 'admin' if manager else 'client',
-           'permissions': body.permissions or {}, 'device_id': body.device_id,
+           'permissions': body.permissions or {}, 'device_id': None if manager else body.device_id or identity,
            'active': True, 'session_version': 0, 'created_by': user['_id']}
+    if manager:
+        doc['branch'] = body.branch or ''
+    elif body.system is not None:
+        doc['system'] = body.system.model_dump()
     try:
         database.users.insert_one(doc)
     except DuplicateKeyError as exc:
@@ -195,15 +300,26 @@ def update_user(user_id: str, body: UserUpdate, user: User, database: DB):
     if body.permissions is not None and user['role'] != 'manager':
         raise HTTPException(403, 'فقط مدیریت کل دسترسی‌ها را تعیین می‌کند.')
     changes = body.model_dump(exclude_none=True)
+    if body.username is not None:
+        changes['username'] = body.username.lower()
+    requires_admin = body.branch is not None or (body.permissions is not None and (
+        'users' in body.permissions or body.permissions.get('device-health') == 'write'))
+    if requires_admin and (user['role'] != 'manager' or body.system is not None):
+        raise HTTPException(403, 'تغییر شاخه یا این مجوزها برای این حساب مجاز نیست.')
+    if requires_admin:
+        scope = {'role': 'admin'}
+    elif body.system is not None:
+        scope['role'] = 'client'
     if not changes:
         raise HTTPException(422, 'تغییری برای ذخیره وارد نشده است.')
     update = {'$set': changes}
     if body.active is False:
         update['$inc'] = {'session_version': 1}
-    if body.permissions is not None and ('users' in body.permissions or body.permissions.get('device-health') == 'write'):
-        scope = {'role': 'admin'}
-    updated = database.users.find_one_and_update({'_id': user_id, **scope}, update,
-                                                 return_document=ReturnDocument.AFTER)
+    try:
+        updated = database.users.find_one_and_update({'_id': user_id, **scope}, update,
+                                                     return_document=ReturnDocument.AFTER)
+    except DuplicateKeyError as exc:
+        raise HTTPException(409, 'نام کاربری قبلاً ثبت شده است.') from exc
     if not updated:
         raise HTTPException(404, 'کاربر سازگار با این عملیات پیدا نشد.')
     return public_user(updated)
