@@ -1,4 +1,6 @@
 """Read raw records alongside the processing results linked to their original IDs."""
+from datetime import timedelta, timezone
+import math
 import re
 
 from app.models.log import COLLECTION
@@ -50,6 +52,29 @@ def dataset_timestamp(value):
     }}}}
 
 
+def indexed_dataset_window(start, end):
+    """Prune by the stored Timestamp before interpreting the CSV row."""
+    if start is None or end is None:
+        return []
+    lower, upper = start.timestamp(), end.timestamp()
+    # Lexical ranges are valid for contemporary fixed-width epoch strings.
+    if not 1_000_000_000 <= lower < upper < 10_000_000_000:
+        return []
+    candidates = [{'Timestamp': None}, {'Timestamp': {'$gte': start, '$lt': end}}]
+    for scale in (1, 1000):
+        first, last = lower * scale, upper * scale
+        candidates.extend([
+            {'Timestamp': {'$gte': math.floor(first), '$lt': math.ceil(last)}},
+            {'Timestamp': {'$gte': str(math.floor(first)), '$lt': str(math.ceil(last))}},
+        ])
+    # ISO strings may carry a timezone offset. The exact parsed filter below
+    # removes adjacent dates admitted here to accommodate that offset.
+    first_day = start.astimezone(timezone.utc).date() - timedelta(days=1)
+    after_last_day = end.astimezone(timezone.utc).date() + timedelta(days=2)
+    candidates.append({'Timestamp': {'$gte': first_day.isoformat(), '$lt': after_last_day.isoformat()}})
+    return [{'$match': {'$or': candidates}}]
+
+
 def log_fields():
     return [{'$project': {
         'raw': '$$ROOT', 'timestamp': 1, 'source': 1, 'level': 1, 'message': 1,
@@ -68,7 +93,10 @@ def list_records(database, filters):
     collection = database[COLLECTION if logs else 'dataset_records']
     dates = {operator: value for operator, value in (('$gte', filters.start), ('$lt', filters.end)) if value is not None}
     date_match = [{'$match': {'timestamp': dates}}] if dates else []
-    pipeline = (date_match + log_fields()) if logs else (dataset_fields() + date_match)
+    if logs:
+        pipeline = date_match + log_fields()
+    else:
+        pipeline = indexed_dataset_window(filters.start, filters.end) + dataset_fields() + date_match
     protocol = {'$toUpper': {'$ifNull': [convert('$protocol', 'string'), '']}}
     pipeline.append({'$set': {
         'source_port': convert('$source_port', 'int'), 'destination_port': convert('$destination_port', 'int'),

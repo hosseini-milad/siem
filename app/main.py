@@ -52,6 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "interruption_reason": "Server restarted during training",
                      "interrupted_at": datetime.now(timezone.utc)}})
+                app.state.database.dataset_records.create_index('Timestamp')
                 collection = app.state.database[COLLECTION]
                 collection.create_index([("timestamp", -1), ("_id", -1)])
                 collection.create_index([("source", 1), ("timestamp", -1)])

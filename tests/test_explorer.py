@@ -6,6 +6,7 @@ from pymongo import MongoClient
 
 from app.core.config import Settings
 from app.main import create_app
+from app.services.explorer import indexed_dataset_window
 
 
 def test_explorer_joins_and_filters_real_mongodb(tmp_path):
@@ -56,5 +57,36 @@ def test_explorer_joins_and_filters_real_mongodb(tmp_path):
                 assert get(kind='logs', risk='critical')['total'] == 0
                 assert client.get('/api/v1/explorer/records', params={'destination_port': 65536}).status_code == 422
                 assert client.get('/api/v1/explorer/records', params={'start': day['end'], 'end': day['start']}).status_code == 422
+        finally:
+            mongo.drop_database(settings.mongodb_database)
+
+
+def test_explorer_uses_timestamp_index_for_2025_seconds(tmp_path):
+    settings = Settings(mongodb_database='siem_test_' + uuid4().hex, ml_model_dir=str(tmp_path))
+    start = datetime.fromisoformat('2025-05-17T20:30:00+00:00')
+    end = datetime.fromisoformat('2025-05-18T20:30:00+00:00')
+    with MongoClient(settings.mongodb_uri) as mongo:
+        db = mongo[settings.mongodb_database]
+        try:
+            first, last = int(start.timestamp()), int(end.timestamp())
+            db.dataset_records.insert_many([
+                {'_id': str(i), 'Timestamp': str(last + i)} for i in range(1, 5001)
+            ] + [
+                {'_id': 'lower', 'Timestamp': str(first)},
+                {'_id': 'upper', 'Timestamp': str(last)},
+                {'_id': 'numeric', 'Timestamp': first + 1},
+            ])
+            with TestClient(create_app(settings)) as client:
+                result = client.get('/api/v1/explorer/records', params={
+                    'kind': 'data', 'start': start.isoformat(), 'end': end.isoformat(), 'limit': 15,
+                })
+                assert result.status_code == 200, result.text
+                assert result.json()['total'] == 2
+                assert [row['id'] for row in result.json()['items']] == ['numeric', 'lower']
+
+                plan = db.command('explain', {
+                    'find': 'dataset_records', 'filter': indexed_dataset_window(start, end)[0]['$match'],
+                }, verbosity='executionStats')
+                assert plan['executionStats']['totalDocsExamined'] < 20
         finally:
             mongo.drop_database(settings.mongodb_database)

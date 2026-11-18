@@ -1,12 +1,15 @@
+import logging
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import AwareDatetime, BaseModel, Field
+from pymongo.errors import ExecutionTimeout, PyMongoError
 
 from app.db.session import DB
 from app.schemas.log import LogLevel
 from app.services.explorer import list_records
 
+logger = logging.getLogger('uvicorn.error.siem.explorer')
 router = APIRouter(prefix='/api/v1/explorer', tags=['Search'])
 
 
@@ -30,4 +33,12 @@ class ExplorerFilters(BaseModel):
 def records(database: DB, filters: Annotated[ExplorerFilters, Query()]):
     if filters.start and filters.end and filters.start >= filters.end:
         raise HTTPException(422, 'start must be earlier than end')
-    return list_records(database, filters)
+    try:
+        return list_records(database, filters)
+    except ExecutionTimeout as exc:
+        logger.warning('MongoDB explorer query timed out (kind=%s)', filters.kind)
+        raise HTTPException(503, 'Explorer query timed out. Try a smaller date range or more specific filters.') from exc
+    except PyMongoError as exc:
+        logger.error('MongoDB explorer query failed (kind=%s, error=%s, code=%s)',
+                     filters.kind, type(exc).__name__, getattr(exc, 'code', None))
+        raise
