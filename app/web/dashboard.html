@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>داشبورد SIEM</title>
+  <style>
+    :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #111822; color: #e7edf5; }
+    body { max-width: 72rem; margin: auto; padding: 2rem 1rem; }
+    header, form, .cards { display: flex; align-items: center; flex-wrap: wrap; gap: 1rem; }
+    header { justify-content: space-between; }
+    h1, h2 { margin: 0 0 .75rem; }
+    h2 { font-size: 1.08rem; }
+    a { color: #8de5ca; }
+    form, .cards { margin: 1.25rem 0; }
+    label { display: grid; gap: .4rem; }
+    input, select, button { font: inherit; color: inherit; background: #1c2835; border: 1px solid #607389;
+                           border-radius: .35rem; padding: .45rem .65rem; }
+    button { align-self: end; cursor: pointer; }
+    .cards > div, article { background: #1c2835; border: 1px solid #344457; border-radius: .65rem; padding: 1rem; }
+    .cards > div { flex: 1 1 9rem; }
+    .cards strong { display: block; margin-top: .4rem; font-size: 1.5rem; }
+    .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 25rem), 1fr)); gap: 1rem; }
+    article:first-child { grid-column: 1 / -1; }
+    ol { list-style: none; padding: 0; margin: 0; max-height: 24rem; overflow: auto; }
+    li { display: grid; grid-template-columns: minmax(5rem, 1fr) 2fr auto; gap: .65rem; align-items: center;
+         padding-block: .3rem; overflow-wrap: anywhere; }
+    meter { width: 100%; accent-color: #64d4ae; }
+    #status { min-height: 1.5rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>داشبورد SIEM</h1>
+    <a href="/docs">اکشن‌های Swagger</a>
+  </header>
+  <section class="cards" aria-label="وضعیت سامانه">
+    <div>هشدارهای فعال<strong id="alerts">—</strong></div>
+    <div>رخدادهای فعال<strong id="incidents">—</strong></div>
+    <div>قواعد فعال<strong id="rules">—</strong></div>
+  </section>
+  <form id="filters">
+    <label>بازه
+      <select name="hours">
+        <option value="24">۲۴ ساعت</option>
+        <option value="168">۷ روز</option>
+        <option value="720">۳۰ روز</option>
+      </select>
+    </label>
+    <label>منبع <input name="source" maxlength="255" dir="auto"></label>
+    <label>سطح
+      <select name="level">
+        <option value="">همه</option>
+        <option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option><option>CRITICAL</option>
+      </select>
+    </label>
+    <label>متن <input name="q" maxlength="1024" dir="auto"></label>
+    <button type="submit">اعمال فیلتر</button>
+  </form>
+  <p id="status" role="status" aria-live="polite"></p>
+  <section class="charts">
+    <article><h2>روند حجم رویدادها (UTC)</h2><ol id="trend"></ol></article>
+    <article><h2>سطح رویدادها</h2><ol id="levels"></ol></article>
+    <article><h2>منابع پرتکرار</h2><ol id="sources"></ol></article>
+  </section>
+  <script>
+    const filters = document.querySelector('#filters');
+    const submit = filters.querySelector('button');
+    const status = document.querySelector('#status');
+    const number = new Intl.NumberFormat('fa-IR');
+    const charts = ['trend', 'levels', 'sources'];
+
+    async function get(path) {
+      const response = await fetch('/api/v1' + path);
+      if (!response.ok) throw new Error(String(response.status));
+      return response.json();
+    }
+
+    function render(id, rows, labelFor) {
+      const list = document.getElementById(id);
+      list.replaceChildren();
+      if (!rows.length) {
+        const empty = document.createElement('li');
+        empty.textContent = 'بدون داده';
+        list.append(empty);
+        return;
+      }
+      const max = Math.max(1, ...rows.map(row => row.count));
+      for (const row of rows) {
+        const item = document.createElement('li');
+        const label = document.createElement('bdi');
+        label.textContent = labelFor(row);
+        const meter = document.createElement('meter');
+        meter.max = max;
+        meter.value = row.count;
+        meter.setAttribute('aria-label', label.textContent);
+        const count = document.createElement('span');
+        count.textContent = number.format(row.count);
+        item.append(label, meter, count);
+        list.append(item);
+      }
+    }
+
+    async function load() {
+      const data = new FormData(filters);
+      const hours = Number(data.get('hours'));
+      const end = new Date();
+      const params = new URLSearchParams({
+        start: new Date(end.getTime() - hours * 3600000).toISOString(),
+        end: end.toISOString(),
+        interval: hours === 24 ? 'hour' : 'day'
+      });
+      for (const key of ['source', 'level', 'q']) {
+        if (data.get(key).trim()) params.set(key, data.get(key).trim());
+      }
+      submit.disabled = true;
+      status.textContent = 'در حال بارگذاری…';
+      try {
+        const [overview, stats] = await Promise.all([get('/overview'), get('/dashboard/charts?' + params)]);
+        document.querySelector('#alerts').textContent = number.format(overview.open_alerts);
+        document.querySelector('#incidents').textContent = number.format(overview.active_incidents);
+        document.querySelector('#rules').textContent = number.format(overview.enabled_rules);
+        render('trend', stats.series, row => row.timestamp.slice(0, stats.interval === 'hour' ? 16 : 10).replace('T', ' '));
+        render('levels', stats.levels, row => row.level);
+        render('sources', stats.top_sources, row => row.source);
+        status.textContent = number.format(stats.event_count) + ' رویداد';
+      } catch (error) {
+        for (const id of charts) document.getElementById(id).replaceChildren();
+        for (const id of ['alerts', 'incidents', 'rules']) document.getElementById(id).textContent = '—';
+        status.textContent = 'خطا در دریافت دادهٔ داشبورد.';
+      } finally {
+        submit.disabled = false;
+      }
+    }
+    filters.addEventListener('submit', event => { event.preventDefault(); load(); });
+    load();
+  </script>
+</body>
+</html>

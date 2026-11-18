@@ -1,7 +1,6 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pymongo import MongoClient
@@ -9,7 +8,6 @@ from pymongo import MongoClient
 from app.core.config import Settings
 from app.main import create_app
 from app.services import siem
-from app.services.elk import Elk
 
 
 @pytest.fixture
@@ -36,11 +34,17 @@ def test_menu_tags_and_no_authentication(setup):
     used = {tag for path in spec['paths'].values() for operation in path.values()
             if isinstance(operation, dict) for tag in operation.get('tags', [])}
     assert used <= declared
-    assert {'Elasticsearch', 'Logstash', 'Kibana', 'Alerts', 'Incidents', 'Detection Rules'} <= declared
+    assert {'Overview', 'Search', 'Ingestion', 'Alerts', 'Incidents', 'Detection Rules'} <= declared
+    assert {'Elasticsearch', 'Logstash', 'Kibana'}.isdisjoint(declared)
+    assert '/api/v1/ingestion/logstash' not in spec['paths']
     assert not spec.get('security') and not spec.get('components', {}).get('securitySchemes')
     menu = client.get('/api/v1/system/navigation').json()
     assert not menu['authentication'] and not menu['agents_in_scope']
-    assert all(set(item['tags']) <= declared for item in menu['menus'])
+    assert [tag for item in menu['menus'] for tag in item['tags']] == [item['name'] for item in spec['tags']]
+    assert client.get(menu['dashboard_path']).status_code == 200
+    settings = client.get('/api/v1/system/settings').json()
+    assert settings['mongodb_database'] == db.name
+    assert 'mongodb_uri' not in settings
     assert client.get('/api/v1/system/status').json()['mongodb']['available']
 
 
@@ -88,56 +92,52 @@ def test_threshold_rules_and_ml_alerts_are_deduplicated(setup, monkeypatch):
     assert client.get('/api/v1/overview').json()['event_count'] == 3
 
 
-def test_logstash_receiver_is_idempotent_and_rejects_conflicting_payload(setup):
+def test_batch_receiver_is_idempotent_and_rejects_conflicting_payload(setup):
     client, db = setup
     body = {'batch_id': str(uuid4()), 'events': [event(), event(source='router')]}
-    first = client.post('/api/v1/ingestion/logstash', json=body)
+    first = client.post('/api/v1/ingestion/batches', json=body)
     assert first.status_code == 200, first.text
     assert first.json()['inserted'] == 2
     assert client.post('/api/v1/ingestion/logstash', json=body).json()['deduplicated'] == 2
     assert client.get('/api/v1/ingestion/batches/' + body['batch_id']).json()['status'] == 'stored'
     changed = {**body, 'events': [event(message='changed')]}
-    assert client.post('/api/v1/ingestion/logstash', json=changed).status_code == 409
+    assert client.post('/api/v1/ingestion/batches', json=changed).status_code == 409
     assert db.log_events.count_documents({}) == 2
 
 
-def test_elasticsearch_checkpoint_retries_and_late_events(setup):
+def test_native_search_and_charts_include_legacy_and_new_events(setup):
     client, db = setup
-    client.post('/api/v1/logs', json=event())
-    calls = []
-    fail = [True]
-    def upstream(request):
-        calls.append(request)
-        if request.url.path.startswith('/_cat/indices'):
-            return httpx.Response(200, json=[{'index': 'siem-events'}])
-        if request.url.path.endswith('/_mapping'):
-            return httpx.Response(200, json={'siem-events': {'mappings': {'properties': {'@timestamp': {'type': 'date'}}}}})
-        if request.url.path == '/_bulk':
-            return httpx.Response(200, json={'errors': fail[0], 'items': [{'index': {'status': 201}}]})
-        raise AssertionError(str(request.url))
-    with httpx.Client(transport=httpx.MockTransport(upstream)) as transport:
-        client.app.state.elk = Elk(client.app.state.settings, transport)
-        assert client.post('/api/v1/elasticsearch/sync', json={'limit': 500}).status_code == 503
-        assert db.elastic_sync_state.find_one() is None
-        assert '_search_index' not in db.log_events.find_one()
-        fail[0] = False
-        assert client.post('/api/v1/elasticsearch/sync', json={'limit': 500}).json()['indexed'] == 1
-        assert client.post('/api/v1/elasticsearch/sync', json={'limit': 500}).json()['indexed'] == 0
-        # A later insert with an older receipt time must still be discovered.
-        row = db.log_events.find_one()
-        db.log_events.insert_one({**row, '_id': str(uuid4()), 'received_at': datetime(2020, 1, 1, tzinfo=timezone.utc), '_search_index': None})
-        assert client.post('/api/v1/elasticsearch/sync', json={'limit': 500}).json()['indexed'] == 1
-    response = client.get('/api/v1/logs').json()
-    assert response['total'] == 2 and '_search_index' not in str(response)
+    existing = client.post('/api/v1/logs', json=event(message='Denied [audit]')).json()
+    db.log_events.update_one({'_id': existing['id']}, {'$set': {'_search_index': 'siem-events'}})
+    db.elastic_sync_state.insert_one({'_id': 'log_events'})
+    batch = {'events': [
+        event(message='denied [AUDIT]'),
+        event(source='dns', message='denied [audit]'),
+        event(message='denied audit'),
+        event(level='INFO', message='denied [audit]'),
+        event(timestamp='2020-01-01T00:00:00Z', message='denied [audit]'),
+    ]}
+    assert client.post('/api/v1/ingestion/batches', json=batch).json()['inserted'] == 5
 
+    filters = {'q': '[audit]', 'source': 'firewall', 'level': 'WARNING'}
+    response = client.get('/api/v1/search/events', params={**filters, 'limit': 1}).json()
+    assert response['engine'] == 'mongodb'
+    assert response['total'] == 2 and len(response['items']) == 1
+    other_page = client.get('/api/v1/search/events', params={**filters, 'limit': 1, 'offset': 1}).json()
+    rows = response['items'] + other_page['items']
+    assert len({row['id'] for row in rows}) == 2
+    assert existing['id'] in {row['id'] for row in rows}
+    assert all('_search_index' not in row for row in rows)
+    assert db.log_events.find_one({'_id': existing['id']})['_search_index'] == 'siem-events'
+    assert db.elastic_sync_state.count_documents({}) == 1
 
-def test_upstream_unavailable_is_reported_without_fake_success(setup):
-    client, db = setup
-    def offline(request):
-        raise httpx.ConnectError('private connection details', request=request)
-    with httpx.Client(transport=httpx.MockTransport(offline)) as transport:
-        client.app.state.elk = Elk(client.app.state.settings, transport)
-        assert client.get('/api/v1/elasticsearch/status').json()['available'] is False
-        assert client.post('/api/v1/kibana/setup').status_code == 503
-        assert client.get('/api/v1/search/events').status_code == 503
-        assert 'private connection details' not in client.get('/api/v1/kibana/status').text
+    response = client.get('/api/v1/dashboard/charts', params={**filters, 'interval': 'day'}).json()
+    assert response['event_count'] == 2 and response['interval'] == 'day'
+    assert response['levels'] == [{'level': 'WARNING', 'count': 2}]
+    assert response['top_sources'] == [{'source': 'firewall', 'count': 2}]
+    assert sum(row['count'] for row in response['series']) == 2
+    assert client.get('/api/v1/dashboard/charts', params={'q': 'not found'}).json()['series'] == []
+    assert client.get('/api/v1/search/events', params={'q': '.*'}).json()['total'] == 0
+    assert client.get('/api/v1/search/events', params={'start': '2020-01-01T00:00:00Z'}).status_code == 422
+    window = {'start': '2020-01-02T00:00:00Z', 'end': '2020-01-01T00:00:00Z'}
+    assert client.get('/api/v1/dashboard/charts', params=window).status_code == 422

@@ -1,17 +1,14 @@
 from datetime import timezone
-from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import AwareDatetime
-from pymongo.database import Database
 
-from app.db.session import get_database
+from app.db.session import DB
 from app.schemas.log import LogBatch, LogCreate, LogLevel, LogPage, LogRead
 from app.services import logs
 
 router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
-DB = Annotated[Database, Depends(get_database)]
 
 
 @router.post("", response_model=LogRead, status_code=201, summary="ذخیره یک لاگ")

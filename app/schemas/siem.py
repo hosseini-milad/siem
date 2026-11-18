@@ -67,7 +67,3 @@ class PredictionAlerts(StrictBody):
 class IngestionBatch(StrictBody):
     batch_id: UUID = Field(default_factory=uuid4)
     events: list[LogCreate] = Field(min_length=1, max_length=500)
-
-
-class SyncRequest(StrictBody):
-    limit: int = Field(default=5000, ge=1, le=50000)
