@@ -169,3 +169,29 @@ def test_flat_collision_and_legacy_output_migration(setup):
     assert run(client)['status'] == 'failed'
     assert db.standard_records.find_one({'_id': 'a'}) == a
     assert db.normal_records.find_one({'_id': 'a'})['source_record_count'] == 0.5
+
+
+
+def test_finalize_new_dataset_records_and_expose_standard_label(setup):
+    client, db = setup
+    db.dataset_records.insert_one({'_id': 'clean', 'Label': 'Benign', 'Timestamp': '1747584000'})
+    first = client.post('/api/v1/standardization/finalize')
+    assert first.status_code == 202
+    first_run = first.json()
+    assert client.get('/api/v1/standardization/runs/' + first_run['id']).json()['status'] == 'completed'
+    assert db.standard_records.find_one({'original_id': 'clean'})['Label'] == 0
+
+    db.dataset_records.insert_one({'_id': 'second', 'Label': 'DDoS', 'Timestamp': '1747584001'})
+    resp = client.post('/api/v1/standardization/finalize')
+    assert resp.status_code == 202
+    job = resp.json()
+    assert client.get('/api/v1/standardization/runs/' + job['id']).json()['status'] == 'completed'
+    normalization = client.get('/api/v1/normalization/runs/' + job['normalization_run_id']).json()
+    assert normalization['processed'] == 1 and normalization['skipped'] == 1
+    assert db.standard_records.count_documents({}) == 2
+    result = client.get('/api/v1/explorer/records', params={'risk': 'attack'}).json()
+    assert result['total'] == 1
+    row = result['items'][0]
+    assert row['raw']['Label'] == 'DDoS'
+    assert row['standardized']['original_id'] == 'second'
+    assert row['risk'] == {'score': 1, 'severity': 'attack'}

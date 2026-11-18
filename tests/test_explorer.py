@@ -25,7 +25,15 @@ def test_explorer_joins_and_filters_real_mongodb(tmp_path):
                 {'_id': 'flow:4', 'Timestamp': str(int(stamp.timestamp() * 1000)), 'Label': ' 0 '},
                 {'_id': 'flow:5', 'Timestamp': '2026-11-18T08:00:00Z', 'Label': '0.65'},
             ])
-            db.normal_records.insert_one({'_id': 'flow:1', 'original_id': 'flow:1', 'Dst Port': .44})
+            db.normal_records.insert_many([
+                {'_id': 'norm:1', 'original_id': 'flow:1', 'Label': 0, 'Dst Port': .44},
+                {'_id': 'norm:3', 'original_id': 'flow:3', 'Label': 1},
+            ])
+            db.standard_records.insert_many([
+                {'_id': 'standard:1', 'original_id': 'flow:1', 'Label': 1},
+                {'_id': 'standard:4', 'original_id': 'flow:4', 'Label': 0},
+                {'_id': 'standard:5', 'original_id': 'flow:5', 'Label': .65},
+            ])
             db.ml_predictions.insert_one({'_id': 'flow:1', 'original_id': 'flow:1', 'attack_probability': .85})
             with TestClient(create_app(settings)) as client:
                 def get(**query):
@@ -39,6 +47,9 @@ def test_explorer_joins_and_filters_real_mongodb(tmp_path):
                 row = page['items'][0]
                 assert row['raw'] == raw
                 assert row['normalized']['original_id'] == 'flow:1'
+                assert row['standardized']['_id'] == 'standard:1'
+                assert row['normalized']['Label'] == 0
+                assert get(q='flow:3')['items'][0]['risk'] is None
                 assert row['risk'] == {'score': 1, 'severity': 'attack'}
                 assert get(**day, risk='high')['items'][0]['risk'] == {'score': .65, 'severity': 'high'}
                 assert get(**day, risk='benign')['items'][0]['risk'] == {'score': 0, 'severity': 'benign'}
@@ -60,7 +71,8 @@ def test_explorer_joins_and_filters_real_mongodb(tmp_path):
                 assert get(kind='logs', risk='critical')['total'] == 0
                 event['attributes']['Label'] = 0.9
                 assert client.post('/api/v1/logs', json=event).status_code == 201
-                assert get(kind='logs', risk='critical')['items'][0]['risk'] == {'score': .9, 'severity': 'critical'}
+                assert get(kind='logs', risk='critical')['total'] == 0
+                assert get(kind='logs', risk='unscored')['total'] == 2
                 assert client.get('/api/v1/explorer/records', params={'destination_port': 65536}).status_code == 422
                 assert client.get('/api/v1/explorer/records', params={'start': day['end'], 'end': day['start']}).status_code == 422
         finally:

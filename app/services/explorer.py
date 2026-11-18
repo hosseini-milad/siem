@@ -83,28 +83,27 @@ def indexed_dataset_window(start, end):
 def log_fields():
     return [{'$project': {
         'raw': '$$ROOT', 'timestamp': 1, 'source': 1, 'level': 1, 'message': 1,
-        'label': {'$ifNull': ['$Label', '$attributes.Label', '$attributes.label', None]},
         'source_ip': '$attributes.source_ip', 'destination_ip': '$attributes.destination_ip',
         'source_port': '$attributes.source_port', 'protocol': '$attributes.protocol',
         'destination_port': {'$ifNull': ['$attributes.destination_port', '$attributes.port', None]},
     }}, {'$unset': 'raw._search_index'}]
 
 
-def label_score():
-    text = {'$toLower': {'$trim': {'input': {'$ifNull': [convert('$label', 'string'), '']}}}}
-    return {'$let': {'vars': {'text': text}, 'in': {'$switch': {
-        'branches': [
-            {'case': {'$in': ['$$text', ['benign', 'normal']]}, 'then': 0},
-            {'case': {'$eq': ['$$text', 'attack']}, 'then': 1},
-        ],
-        'default': {'$let': {'vars': {'score': convert('$$text', 'double')}, 'in': {'$cond': [
-            {'$and': [{'$gte': ['$$score', 0]}, {'$lte': ['$$score', 1]}]}, '$$score', None,
-        ]}}},
-    }}}}
+def label_score(source):
+    text = {'$toLower': {'$trim': {'input': {'$ifNull': [convert({'$arrayElemAt': [source, 0]}, 'string'), '']}}}}
+    return {'$let': {'vars': {'score': convert(text, 'double')}, 'in': {'$cond': [
+        {'$and': [{'$gte': ['$$score', 0]}, {'$lte': ['$$score', 1]}]}, '$$score', None,
+    ]}}}
 
 
-def lookup(collection, alias):
-    return {'$lookup': {'from': collection, 'localField': '_id', 'foreignField': '_id', 'as': alias}}
+def lookup(collection, alias, pipeline=None):
+    return {'$lookup': {'from': collection, 'localField': '_id', 'foreignField': 'original_id',
+                        'as': alias, **({'pipeline': pipeline} if pipeline else {})}}
+
+
+def final_score_stages():
+    return [lookup('standard_records', 'final_label', [{'$project': {'Label': 1}}]),
+            {'$set': {'risk_score': label_score('$final_label.Label')}}]
 
 
 def list_records(database, filters):
@@ -121,7 +120,6 @@ def list_records(database, filters):
         pipeline = candidates + candidate_limit + dataset_fields() + date_match
     protocol = {'$toUpper': {'$ifNull': [convert('$protocol', 'string'), '']}}
     pipeline.append({'$set': {
-        'risk_score': label_score(),
         'source_port': convert('$source_port', 'int'), 'destination_port': convert('$destination_port', 'int'),
         'protocol': {'$switch': {'branches': [
             {'case': {'$eq': [protocol, code]}, 'then': name}
@@ -140,13 +138,17 @@ def list_records(database, filters):
     if criteria:
         pipeline.append({'$match': criteria})
     if filters.risk:
+        if not logs:
+            pipeline.extend(final_score_stages())
         pipeline.append({'$match': {'risk_score': RISK_BANDS.get(filters.risk)}})
 
     count = next(collection.aggregate([*pipeline, {'$count': 'total'}], maxTimeMS=TIMEOUT_MS), {'total': 0})
     rows_pipeline = [*pipeline, {'$sort': {'timestamp': -1, '_id': -1}},
                      {'$skip': filters.offset}, {'$limit': filters.limit}]
     if not logs:
-        rows_pipeline.append(lookup('normal_records', 'normalized'))
+        rows_pipeline.extend([lookup('normal_records', 'normalized'), lookup('standard_records', 'standardized')])
+        if not filters.risk:
+            rows_pipeline.append({'$set': {'risk_score': label_score('$standardized.Label')}})
     rows = collection.aggregate(rows_pipeline, maxTimeMS=TIMEOUT_MS, allowDiskUse=True)
     return {'items': [public_record(row) for row in rows], **count, 'limit': filters.limit, 'offset': filters.offset}
 
@@ -165,4 +167,5 @@ def public_record(row):
             severity = next(name for name in ('critical', 'high', 'medium', 'low')
                             if score >= RISK_BANDS[name].get('$gte', 0))
         risk = {'score': score, 'severity': severity}
-    return {**output, 'id': str(row['_id']), 'normalized': next(iter(row.get('normalized', [])), None), 'risk': risk}
+    return {**output, 'id': str(row['_id']), 'normalized': next(iter(row.get('normalized', [])), None),
+            'standardized': next(iter(row.get('standardized', [])), None), 'risk': risk}
