@@ -3,7 +3,7 @@ from threading import Lock
 from datetime import datetime, timezone
 import logging
 
-from app.api import alerts, dashboard, detections, incidents, ingestion, search, system
+from app.api import alerts, dashboard, detections, explorer, incidents, ingestion, search, system
 
 from app.api.machine_learning import router as machine_learning_router
 from app.services.machine_learning import ModelManager
@@ -76,7 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(normalization_router)
     app.include_router(standardization_router)
     app.include_router(machine_learning_router)
-    for module in (ingestion, search, dashboard, detections, alerts, incidents, system):
+    for module in (ingestion, search, explorer, dashboard, detections, alerts, incidents, system):
         app.include_router(module.router)
 
     @app.exception_handler(PyMongoError)
