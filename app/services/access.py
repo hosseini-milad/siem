@@ -1,0 +1,55 @@
+import hashlib
+import hmac
+import secrets
+from datetime import datetime, timezone
+from threading import BoundedSemaphore
+
+SECTIONS = {
+    'overview': 'نمای کلی', 'ingestion': 'ورود و پردازش', 'events': 'جست‌وجوی رویدادها',
+    'explorer': 'کاوش داده‌ها', 'detections': 'قواعد تشخیص', 'alerts': 'هشدارها',
+    'incidents': 'رخدادهای امنیتی', 'analytics': 'تحلیل هوشمند', 'current-model': 'مدل جاری',
+    'system': 'سامانه', 'device-health': 'سلامت سیستم‌ها', 'users': 'کاربران',
+}
+COOKIE = 'siem_session'
+SESSION_SECONDS = 8 * 60 * 60
+password_slots = BoundedSemaphore(2)
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def password_hash(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    with password_slots:
+        digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**17, r=8, p=1,
+                                maxmem=192 * 1024**2)
+    return {'salt': salt, 'digest': digest.hex()}
+
+
+def password_matches(password, stored):
+    candidate = password_hash(password, stored['salt'] if stored else '0' * 32)
+    return hmac.compare_digest(candidate['digest'], stored['digest'] if stored else '0' * 128) and stored is not None
+
+
+def token_digest(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def public_user(user):
+    return {'id': user['_id'], **{key: user[key] for key in ('username', 'name', 'role', 'active')},
+            'device_id': user.get('device_id'), 'permissions': user.get('permissions', {})}
+
+
+def allowed(user, section, write=False):
+    if user['role'] == 'manager':
+        return True
+    grant = user.get('permissions', {}).get(section)
+    return grant == 'write' or (not write and grant == 'read')
+
+
+def initialize_access(database):
+    database.users.create_index('username', unique=True)
+    database.users.create_index('device_id', unique=True, partialFilterExpression={'device_id': {'$type': 'string'}})
+    database.sessions.create_index('expires_at', expireAfterSeconds=0)
+    database.login_attempts.create_index('expires_at', expireAfterSeconds=0)

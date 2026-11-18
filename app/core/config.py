@@ -12,3 +12,5 @@ class Settings(BaseSettings):
     datasets_root: str = "ds/Datasets"
     ml_model_dir: str = "data/ml"
     ml_threads: int = Field(default=2, ge=1, le=32)
+    auth_required: bool = True
+    session_cookie_secure: bool = True

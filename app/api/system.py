@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 
 from app.db.session import DB
+from app.services.access import SECTIONS, allowed
 
 router = APIRouter(prefix='/api/v1')
 
@@ -36,12 +37,21 @@ OPENAPI_TAGS = [{'name': tag, 'description': TAG_DESCRIPTIONS[tag]}
 
 
 @router.get('/system/navigation', tags=['System'], summary='منوی پنل و ترتیب تگ‌های Swagger')
-def navigation():
+def navigation(request: Request, response: Response):
+    user = getattr(request.state, 'siem_user', None)
+    menus = [{'id': key, 'label': label, 'tags': tags} for key, label, tags in MENUS]
+    if user:
+        response.headers['Cache-Control'] = 'no-store'
+        for key, parent in (('explorer', 'events'), ('current-model', 'analytics'), ('device-health', 'system'), ('users', 'system')):
+            index = next(i for i, menu in enumerate(menus) if menu['id'] == parent)
+            menus.insert(index + 1, {'id': key, 'label': SECTIONS[key], 'parent': parent, 'tags': []})
+        menus = [menu for menu in menus if allowed(user, menu['id']) and
+                 (menu['id'] != 'users' or user['role'] != 'client')]
     return {
-        'authentication': False,
+        'authentication': request.app.state.settings.auth_required,
         'agents_in_scope': False,
         'dashboard_path': '/dashboard',
-        'menus': [{'id': key, 'label': label, 'tags': tags} for key, label, tags in MENUS],
+        'menus': menus,
     }
 
 

@@ -3,7 +3,7 @@ from threading import Lock
 from datetime import datetime, timezone
 import logging
 
-from app.api import alerts, dashboard, detections, explorer, incidents, ingestion, search, system
+from app.api import access, alerts, dashboard, detections, explorer, incidents, ingestion, search, system
 
 from app.api.machine_learning import router as machine_learning_router
 from app.services.machine_learning import ModelManager
@@ -11,7 +11,9 @@ from app.api.standardization import router as standardization_router
 from app.api.datasets import router as datasets_router
 from app.api.normalization import router as normalization_router
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse, RedirectResponse
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -20,6 +22,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.logs import router
 from app.core.config import Settings
 from app.models.log import COLLECTION
+from app.services.access import initialize_access
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 
 
@@ -36,6 +39,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             def initialize():
                 client.admin.command("ping")
+                if config.auth_required:
+                    initialize_access(app.state.database)
                 interrupted = app.state.database.normalization_runs.update_many(
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "interruption_reason": "Server started again before this run finished (restart, reload, or another worker)",
@@ -72,12 +77,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             client.close()
 
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
-                  description="SIEM هوشمند: رویدادها، هشدارها، قواعد، رخدادها، جست‌وجوی MongoDB و مدل‌های LightGBM/CatBoost. بدون احراز هویت؛ اجنت‌ها خارج از این مرحله‌اند.",
-                  openapi_tags=system.OPENAPI_TAGS,
+                  description="SIEM هوشمند: رویدادها، هشدارها، قواعد، رخدادها، جست‌وجوی MongoDB و مدل‌های LightGBM/CatBoost. با احراز هویت و کنترل دسترسی.",
+                  dependencies=[Depends(access.authorize)],
+                  openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}],
                   swagger_ui_parameters={"displayRequestDuration": True, "docExpansion": "none"},
                   responses={503: {"description": "MongoDB operation unavailable; batch writes may be partial"}})
     app.state.settings = config
     app.state.import_lock = Lock()
+    app.include_router(access.router)
     app.include_router(router)
     app.include_router(datasets_router)
     app.include_router(normalization_router)
@@ -85,6 +92,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(machine_learning_router)
     for module in (ingestion, search, explorer, dashboard, detections, alerts, incidents, system):
         app.include_router(module.router)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith(('/api/v1/auth/', '/api/v1/users')):
+            return JSONResponse(status_code=422, content={"detail": "مقادیر فرم معتبر نیستند."})
+        return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(PyMongoError)
     async def database_error(request: Request, exc: PyMongoError):
