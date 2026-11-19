@@ -57,6 +57,34 @@ def test_http_logs_accept_raw_syslog_and_json(client):
     assert client.get("/logs").status_code == 405
 
 
+def test_http_logs_accept_agent_json_payloads(client):
+    payload = {
+        "hostname": "windows-server", "collected_at": "2026-11-19T10:17:16+03:30",
+        "severity": "WARN", "logs": [{"channel": "Application", "event_id": 1001}],
+        "metrics": {"cpu_percent": 18.5},
+    }
+    response = client.post("/logs", json=payload)
+    assert response.status_code == 201
+    row = response.json()
+    assert row["source"] == "windows-server"
+    assert row["timestamp"] == "2026-11-19T06:47:16Z"
+    assert row["level"] == "WARNING"
+    assert row["message"] == "Agent payload with 1 log(s)"
+    assert row["attributes"]["agent_payload"] == payload
+    assert row["attributes"]["transport"] == "HTTP"
+
+    batch = [{"message": "first"}, {"message": "second"}]
+    row = client.post("/logs", json=batch).json()
+    assert row["message"] == "Agent JSON batch with 2 item(s)"
+    assert row["attributes"]["agent_payload"] == batch
+
+    unusual = client.post("/logs", json={"message": "event", "severity": "notice",
+                                         "timestamp": "local time"}).json()
+    assert unusual["level"] == "INFO"
+    assert unusual["attributes"]["agent_level"] == "notice"
+    assert unusual["attributes"]["agent_timestamp"] == "local time"
+
+
 def test_http_log_token_is_limited_to_ingestion(client, monkeypatch):
     from pydantic import SecretStr
 

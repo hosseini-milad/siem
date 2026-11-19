@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
+import json
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import AwareDatetime, ValidationError
+from pydantic import AwareDatetime, TypeAdapter, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from app.db.session import DB
@@ -13,6 +14,60 @@ from app.services.raw_logs import parse_raw_log
 router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
 http_ingestion_router = APIRouter(tags=["Logs"])
 MAX_HTTP_LOG_BYTES = 2 * 1024 * 1024
+TIMESTAMP = TypeAdapter(AwareDatetime)
+LEVEL_ALIASES = {"WARN": LogLevel.WARNING, "FATAL": LogLevel.CRITICAL}
+
+
+def agent_json_event(payload, request: Request) -> LogCreate:
+    received_at = datetime.now(timezone.utc)
+    source_ip = request.client.host if request.client else "http-agent"
+    source_port = request.client.port if request.client else None
+    attributes = {"transport": "HTTP", "protocol": "TCP", "agent_payload": payload,
+                  "source_ip": source_ip}
+    if source_port is not None:
+        attributes["source_port"] = source_port
+
+    source = source_ip
+    timestamp = received_at
+    level = LogLevel.INFO
+    message = "Agent JSON payload"
+    if isinstance(payload, dict):
+        candidate_source = next((payload.get(key) for key in
+                                 ("source", "hostname", "host", "device_name", "agent_id")
+                                 if payload.get(key) is not None), None)
+        if candidate_source is not None:
+            source = str(candidate_source).strip()[:255] or source_ip
+
+        candidate_message = next((payload.get(key) for key in
+                                  ("message", "msg", "event_message", "description")
+                                  if payload.get(key) is not None), None)
+        if candidate_message is not None:
+            message = str(candidate_message).strip()[:65536] or message
+        elif isinstance(payload.get("logs"), list):
+            message = f"Agent payload with {len(payload['logs'])} log(s)"
+
+        candidate_level = next((payload.get(key) for key in ("level", "severity")
+                                if payload.get(key) is not None), None)
+        if candidate_level is not None:
+            level_name = str(candidate_level).strip().upper()
+            try:
+                level = LEVEL_ALIASES[level_name] if level_name in LEVEL_ALIASES else LogLevel(level_name)
+            except ValueError:
+                attributes["agent_level"] = candidate_level
+
+        candidate_timestamp = next((payload.get(key) for key in
+                                    ("timestamp", "collected_at", "created_at", "time")
+                                    if payload.get(key) is not None), None)
+        if candidate_timestamp is not None:
+            try:
+                timestamp = TIMESTAMP.validate_python(candidate_timestamp).astimezone(timezone.utc)
+            except (ValidationError, ValueError, OverflowError):
+                attributes["agent_timestamp"] = candidate_timestamp
+    elif isinstance(payload, list):
+        message = f"Agent JSON batch with {len(payload)} item(s)"
+
+    return LogCreate(timestamp=timestamp, source=source, level=level,
+                     message=message, attributes=attributes)
 
 
 @http_ingestion_router.post("/logs", response_model=LogRead, status_code=201,
@@ -27,7 +82,10 @@ async def receive_http_log(request: Request, database: DB):
     media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     try:
         if media_type == "application/json":
-            event = LogCreate.model_validate_json(body)
+            try:
+                event = LogCreate.model_validate_json(body)
+            except ValidationError:
+                event = agent_json_event(json.loads(body), request)
         else:
             message = body.decode("utf-8").strip()
             if not 1 <= len(message) <= 65536:
@@ -37,7 +95,7 @@ async def receive_http_log(request: Request, database: DB):
             if request.client:
                 attributes.update(source_ip=source, source_port=request.client.port)
             event = parse_raw_log(message, source, datetime.now(timezone.utc), attributes)
-    except (UnicodeDecodeError, ValidationError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
         raise HTTPException(422, "Expected UTF-8 log text or a valid JSON log") from exc
 
     return (await run_in_threadpool(logs.store_logs, database, [event]))[0]
