@@ -144,8 +144,12 @@ def test_discovered_system_can_be_assigned_and_supplies_live_health(application)
     app.state.database.systems.insert_one({
         '_id': mac, 'mac': mac, 'agent_id': 'DESKTOP-88EQ9K3', 'hostname': 'DESKTOP-88EQ9K3',
         'os_name': 'Windows', 'os_release': '10', 'processor': 'Intel CPU', 'total_ram_gb': 15.89,
-        'total_disk_c_gb': 159.88, 'source_ip': '127.0.0.1', 'cpu_percent': 7.71,
-        'memory_percent': 64.8, 'last_seen': datetime.now(timezone.utc),
+        'total_disk_c_gb': 159.88, 'source_ip': '127.0.0.1',
+        'last_seen': datetime.now(timezone.utc),
+    })
+    app.state.database.system_metrics.insert_one({
+        '_id': 'metric-1', 'system_id': mac, 'agent_id': 'DESKTOP-88EQ9K3',
+        'cpu_percent': 7.71, 'memory_percent': 64.8, 'received_at': datetime.now(timezone.utc),
     })
     admin = TestClient(app, base_url='https://testserver')
     assert login(admin, 'operator').status_code == 200

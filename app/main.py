@@ -24,7 +24,8 @@ from app.api.logs import http_ingestion_router, router
 from app.core.config import Settings
 from app.models.log import COLLECTION, RETENTION_SECONDS
 from app.services.access import initialize_access
-from app.services.agent_ingestion import PAYLOADS, SYSTEMS, SYSTEM_CHANGES, bootstrap_systems
+from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, SYSTEMS,
+                                          SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
 
@@ -80,6 +81,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 collection.create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database[PAYLOADS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database[PAYLOADS].create_index([("agent_id", 1), ("timestamp", -1)])
+                app.state.database[AGENT_LOGS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
+                app.state.database[AGENT_LOGS].create_index([("system_id", 1), ("timestamp", -1)])
+                app.state.database[AGENT_LOGS].create_index([("event_id", 1), ("timestamp", -1)])
+                app.state.database[SYSTEM_METRICS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
+                app.state.database[SYSTEM_METRICS].create_index([("system_id", 1), ("received_at", -1)])
                 app.state.database[SYSTEMS].create_index("mac", unique=True)
                 app.state.database[SYSTEMS].create_index([("agent_id", 1), ("last_seen", -1)])
                 app.state.database[SYSTEM_CHANGES].create_index([("system_id", 1), ("changed_at", -1)])

@@ -3,7 +3,7 @@ import json
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import AwareDatetime, TypeAdapter, ValidationError
+from pydantic import AwareDatetime, BaseModel, TypeAdapter, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from app.db.session import DB
@@ -17,6 +17,13 @@ http_ingestion_router = APIRouter(tags=["Logs"])
 MAX_HTTP_LOG_BYTES = 2 * 1024 * 1024
 TIMESTAMP = TypeAdapter(AwareDatetime)
 LEVEL_ALIASES = {"WARN": LogLevel.WARNING, "FATAL": LogLevel.CRITICAL}
+
+
+class AgentReceipt(BaseModel):
+    accepted: bool = True
+    logs: int
+    inserted: int
+    metrics: bool
 
 
 def agent_json_event(payload, request: Request) -> LogCreate:
@@ -71,7 +78,7 @@ def agent_json_event(payload, request: Request) -> LogCreate:
                      message=message, attributes=attributes)
 
 
-@http_ingestion_router.post("/logs", response_model=LogRead, status_code=201,
+@http_ingestion_router.post("/logs", response_model=LogRead | AgentReceipt, status_code=201,
                             summary="دریافت یک لاگ از طریق HTTP")
 async def receive_http_log(request: Request, database: DB):
     body = bytearray()
@@ -101,13 +108,18 @@ async def receive_http_log(request: Request, database: DB):
     except (UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
         raise HTTPException(422, "Expected UTF-8 log text or a valid JSON log") from exc
 
-    if isinstance(agent_payload, dict):
+    is_agent_payload = isinstance(agent_payload, dict) and any(
+        key in agent_payload for key in ("logs", "metrics", "system_info", "agent_id")
+    )
+    if is_agent_payload:
         source_ip = request.client.host if request.client else "http-agent"
         source_port = request.client.port if request.client else None
-        nested = await run_in_threadpool(
+        result = await run_in_threadpool(
             ingest_agent_payload, database, agent_payload, source_ip, source_port, datetime.now(timezone.utc),
         )
-        return (await run_in_threadpool(logs.store_logs, database, [event, *nested]))[0]
+        if result["events"]:
+            await run_in_threadpool(logs.store_logs, database, result["events"])
+        return AgentReceipt(**{key: result[key] for key in ("logs", "inserted", "metrics")})
     return (await run_in_threadpool(logs.store_logs, database, [event]))[0]
 
 

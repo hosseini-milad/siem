@@ -66,12 +66,11 @@ def test_http_logs_accept_agent_json_payloads(client):
     response = client.post("/logs", json=payload)
     assert response.status_code == 201
     row = response.json()
-    assert row["source"] == "windows-server"
-    assert row["timestamp"] == "2026-11-19T06:47:16Z"
-    assert row["level"] == "WARNING"
-    assert row["message"] == "Agent payload with 1 log(s)"
-    assert row["attributes"]["agent_payload"] == payload
-    assert row["attributes"]["transport"] == "HTTP"
+    assert row == {"accepted": True, "logs": 1, "inserted": 1, "metrics": True}
+    stored = client.app.state.database.log_events.find_one({"attributes.event_id": 1001})
+    assert stored["source"] == "windows-server"
+    assert stored["timestamp"].isoformat() == "2026-11-19T06:47:16+00:00"
+    assert not client.app.state.database.log_events.find_one({"message": "Agent payload with 1 log(s)"})
 
     batch = [{"message": "first"}, {"message": "second"}]
     row = client.post("/logs", json=batch).json()
@@ -93,7 +92,9 @@ def test_agent_payload_creates_system_metrics_events_and_change_history(client):
                     "net_sent_bytes_per_sec": 1391.98, "net_recv_bytes_per_sec": 2512.19},
         "logs": [{"log": "System", "record_number": 28766,
                   "time": "2026-11-19T08:21:18.434923+00:00", "source": "Service Control Manager",
-                  "event_id": 7045, "type": 2, "message": "A service changed"}],
+                  "event_id": 7045, "type": 2, "computer": "DESKTOP-88EQ9K3",
+                  "event_data": {"ServiceName": "System Monitoring Agent", "ImagePath": "agent.exe"},
+                  "message": "A service changed"}],
         "system_info": {"hostname": "DESKTOP-88EQ9K3", "os_name": "Windows", "os_release": "10",
                         "os_version": "10.0.19045", "architecture": "AMD64",
                         "processor": "Intel CPU", "cpu_cores_physical": 4, "cpu_cores_logical": 8,
@@ -102,35 +103,58 @@ def test_agent_payload_creates_system_metrics_events_and_change_history(client):
     }
     assert client.post("/logs", json=payload).status_code == 201
     database = client.app.state.database
-    stored = database.agent_payloads.find_one({"agent_id": payload["agent_id"]})
-    assert stored["cpu_percent"] == 4.18
-    assert stored["memory_percent"] == 66.3
-    assert stored["hostname"] == "DESKTOP-88EQ9K3"
-    assert stored["mac"] == "78:24:af:cb:1b:fd"
-    assert stored["logs"][0]["event_id"] == 7045
-    assert stored["system_info"]["mac_address"] == "78:24:AF:CB:1B:FD"
+    assert database.agent_payloads.count_documents({}) == 0
+    stored = database.agent_logs.find_one({"agent_id": payload["agent_id"]})
+    assert stored["event_id"] == 7045
+    assert stored["ServiceName"] == "System Monitoring Agent"
+    assert stored["ImagePath"] == "agent.exe"
+    assert stored["computer"] == "DESKTOP-88EQ9K3"
+    assert "event_data" not in stored and "logs" not in stored and "metrics" not in stored
+    metric = database.system_metrics.find_one({"agent_id": payload["agent_id"]})
+    assert metric["cpu_percent"] == 4.18 and metric["memory_percent"] == 66.3
 
     mac = "78:24:af:cb:1b:fd"
     system = database.systems.find_one(mac)
     assert system["hostname"] == payload["agent_id"]
-    assert system["cpu_percent"] == 4.18
+    assert "cpu_percent" not in system and "memory_percent" not in system
     event_row = database.log_events.find_one({"attributes.agent_id": payload["agent_id"],
                                                "attributes.event_id": 7045})
     assert event_row["source"] == payload["agent_id"]
     assert event_row["level"] == "WARNING"
     assert event_row["timestamp"].isoformat() == "2026-11-19T08:21:18.434000+00:00"
+    event_count = database.log_events.count_documents({})
+    repeated = client.post("/logs", json=payload).json()
+    assert repeated == {"accepted": True, "logs": 1, "inserted": 0, "metrics": True}
+    assert database.agent_logs.count_documents({}) == 1
+    assert database.log_events.count_documents({}) == event_count
 
     changed = {**payload, "logs": [], "metrics": {**payload["metrics"], "cpu_percent": 21.5},
                "system_info": {**payload["system_info"], "processor": "New CPU"}}
-    assert client.post("/logs", json=changed).status_code == 201
+    changed_response = client.post("/logs", json=changed)
+    assert changed_response.status_code == 201
+    assert changed_response.json() == {"accepted": True, "logs": 0, "inserted": 0, "metrics": True}
+    assert database.agent_logs.count_documents({}) == 1
+    assert database.log_events.count_documents({}) == event_count
     assert database.systems.find_one(mac)["processor"] == "New CPU"
     history = database.system_changes.find_one({"system_id": mac})
     assert history["changes"]["processor"] == {"before": "Intel CPU", "after": "New CPU"}
 
+    later_log = {
+        "agent_id": payload["agent_id"], "timestamp": "2026-11-19T11:53:23+00:00",
+        "logs": [{"log": "System", "record_number": 28767,
+                  "time": "2026-11-19T08:22:18+00:00", "event_id": 7040,
+                  "type": 4, "message": "A later event"}],
+    }
+    assert client.post("/logs", json=later_log).json()["inserted"] == 1
+    later_stored = database.agent_logs.find_one({"record_number": 28767})
+    assert later_stored["system_id"] == mac and later_stored["mac"] == mac
+
     metrics_only = {"agent_id": payload["agent_id"], "metrics": {"cpu_percent": 9.25}, "logs": []}
     assert client.post("/logs", json=metrics_only).status_code == 201
-    assert database.systems.find_one(mac)["cpu_percent"] == 9.25
-    assert database.agent_payloads.index_information()["received_at_1"]["expireAfterSeconds"] == 604800
+    assert "cpu_percent" not in database.systems.find_one(mac)
+    assert database.system_metrics.find_one(sort=[("received_at", -1)])["cpu_percent"] == 9.25
+    assert database.agent_logs.index_information()["received_at_1"]["expireAfterSeconds"] == 604800
+    assert database.system_metrics.index_information()["received_at_1"]["expireAfterSeconds"] == 604800
 
 
 def test_existing_agent_wrapper_bootstraps_system(client):
@@ -146,7 +170,8 @@ def test_existing_agent_wrapper_bootstraps_system(client):
     })
     bootstrap_systems(database)
     system = database.systems.find_one("00:11:22:33:44:55")
-    assert system["agent_id"] == "legacy-agent" and system["cpu_percent"] == 12.5
+    assert system["agent_id"] == "legacy-agent" and "cpu_percent" not in system
+    assert database.system_metrics.find_one({"system_id": "00:11:22:33:44:55"})["cpu_percent"] == 12.5
     bootstrap_systems(database)
     assert database.systems.count_documents({"agent_id": "legacy-agent"}) == 1
 

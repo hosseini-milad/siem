@@ -264,6 +264,20 @@ def session_view(user):
     return {**public_user(user), 'task_access': True}
 
 
+def latest_metrics(database, system_ids):
+    if not system_ids:
+        return {}
+    result = {}
+    cursor = database.system_metrics.find(
+        {'system_id': {'$in': list(system_ids)}}
+    ).sort('received_at', -1)
+    for row in cursor:
+        result.setdefault(row['system_id'], row)
+        if len(result) == len(system_ids):
+            break
+    return result
+
+
 @router.patch('/auth/branch')
 def update_branch(body: BranchUpdate, user: User, database: DB):
     if user['role'] != 'admin':
@@ -280,6 +294,7 @@ def with_branches(database, rows):
                 database.users.find({'_id': {'$in': list(owners)}, 'role': 'admin'}, {'branch': 1})} if owners else {}
     system_ids = {row.get('system_id') for row in rows if row.get('system_id')}
     systems = {row['_id']: row for row in database.systems.find({'_id': {'$in': list(system_ids)}})} if system_ids else {}
+    metrics = latest_metrics(database, system_ids)
     result = [public_user(row) | {
         'branch': branches.get(row.get('created_by'), '') if row['role'] == 'client' else row.get('branch', ''),
         'branch_id': row.get('created_by') if row['role'] == 'client' else row['_id'],
@@ -289,10 +304,11 @@ def with_branches(database, rows):
         system = systems.get(source.get('system_id'))
         if not system:
             continue
+        current_metrics = metrics.get(system['_id'], {})
         stored_profile = source.get('system') or {}
         manual = {key: stored_profile[key] for key in ('name', 'ip', 'type', 'threshold')
                   if key in stored_profile and stored_profile[key] is not None and stored_profile[key] != ''}
-        last_seen = system.get('last_seen')
+        last_seen = current_metrics.get('received_at')
         account['system'] = {
             'id': system['_id'], 'mac': system['mac'], 'name': system.get('hostname') or system.get('agent_id'),
             'ip': system.get('source_ip', ''), 'type': system.get('type', 'desktop'),
@@ -305,12 +321,12 @@ def with_branches(database, rows):
             'storage': f"{system['total_disk_c_gb']:g} GB" if isinstance(system.get('total_disk_c_gb'), (int, float)) else '',
             'threshold': system.get('threshold', 70), 'last_seen': last_seen,
             'online': bool(last_seen and last_seen > cutoff),
-            'cpu': system.get('cpu_percent'), 'ram': system.get('memory_percent'),
-            'disk': system.get('disk_percent'), 'memory_used_mb': system.get('memory_used_mb'),
-            'disk_read_bytes_per_sec': system.get('disk_read_bytes_per_sec'),
-            'disk_write_bytes_per_sec': system.get('disk_write_bytes_per_sec'),
-            'net_sent_bytes_per_sec': system.get('net_sent_bytes_per_sec'),
-            'net_recv_bytes_per_sec': system.get('net_recv_bytes_per_sec'),
+            'cpu': current_metrics.get('cpu_percent'), 'ram': current_metrics.get('memory_percent'),
+            'disk': current_metrics.get('disk_percent'), 'memory_used_mb': current_metrics.get('memory_used_mb'),
+            'disk_read_bytes_per_sec': current_metrics.get('disk_read_bytes_per_sec'),
+            'disk_write_bytes_per_sec': current_metrics.get('disk_write_bytes_per_sec'),
+            'net_sent_bytes_per_sec': current_metrics.get('net_sent_bytes_per_sec'),
+            'net_recv_bytes_per_sec': current_metrics.get('net_recv_bytes_per_sec'),
             **manual,
         }
     return result
@@ -335,6 +351,7 @@ def systems(user: User, database: DB, response: Response,
         raise HTTPException(403, 'دسترسی به فهرست سیستم‌ها مجاز نیست.')
     scope = system_scope(user, database)
     rows = list(database.systems.find(scope).sort([('hostname', 1), ('mac', 1)]).skip(offset).limit(limit))
+    metrics = latest_metrics(database, {item['_id'] for item in rows})
     assignments = {row['system_id']: row for row in database.users.find(
         {'system_id': {'$in': [item['_id'] for item in rows]}}, {'name': 1, 'system_id': 1})}
     response.headers['Cache-Control'] = 'no-store'
@@ -345,15 +362,17 @@ def systems(user: User, database: DB, response: Response,
         'architecture': row.get('architecture'), 'processor': row.get('processor'),
         'cpu_cores_physical': row.get('cpu_cores_physical'), 'cpu_cores_logical': row.get('cpu_cores_logical'),
         'total_ram_gb': row.get('total_ram_gb'), 'total_disk_c_gb': row.get('total_disk_c_gb'),
-        'cpu_percent': row.get('cpu_percent'), 'memory_percent': row.get('memory_percent'),
-        'memory_used_mb': row.get('memory_used_mb'),
-        'disk_read_bytes_per_sec': row.get('disk_read_bytes_per_sec'),
-        'disk_write_bytes_per_sec': row.get('disk_write_bytes_per_sec'),
-        'net_sent_bytes_per_sec': row.get('net_sent_bytes_per_sec'),
-        'net_recv_bytes_per_sec': row.get('net_recv_bytes_per_sec'),
+        'cpu_percent': metrics.get(row['_id'], {}).get('cpu_percent'),
+        'memory_percent': metrics.get(row['_id'], {}).get('memory_percent'),
+        'memory_used_mb': metrics.get(row['_id'], {}).get('memory_used_mb'),
+        'disk_read_bytes_per_sec': metrics.get(row['_id'], {}).get('disk_read_bytes_per_sec'),
+        'disk_write_bytes_per_sec': metrics.get(row['_id'], {}).get('disk_write_bytes_per_sec'),
+        'net_sent_bytes_per_sec': metrics.get(row['_id'], {}).get('net_sent_bytes_per_sec'),
+        'net_recv_bytes_per_sec': metrics.get(row['_id'], {}).get('net_recv_bytes_per_sec'),
         'source_ip': row.get('source_ip'), 'first_seen': row.get('first_seen'),
-        'last_seen': row.get('last_seen'),
-        'online': bool(row.get('last_seen') and row['last_seen'] > cutoff),
+        'last_seen': metrics.get(row['_id'], {}).get('received_at'),
+        'online': bool(metrics.get(row['_id'], {}).get('received_at') and
+                       metrics[row['_id']]['received_at'] > cutoff),
         'assigned_user': ({'id': assignments[row['_id']]['_id'], 'name': assignments[row['_id']]['name']}
                           if row['_id'] in assignments else None),
     } for row in rows], 'total': database.systems.count_documents(scope), 'limit': limit, 'offset': offset}
