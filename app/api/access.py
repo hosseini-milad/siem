@@ -28,6 +28,7 @@ PUBLIC = {'/api/v1/health', '/api/v1/auth/login', '/api/v1/auth/logout'}
 SESSION_ONLY = {'/api/v1/auth/me', '/api/v1/auth/branch', '/api/v1/auth/avatar', '/api/v1/auth/avatars/{token}', '/api/v1/system/navigation'}
 EXACT = {
     '/dashboard': 'overview',
+    '/logs': 'ingestion',
     '/api/v1/ml/model': 'current-model',
     '/api/v1/ml/predict': 'current-model',
     '/api/v1/ml/predict-matrix': 'current-model',
@@ -55,7 +56,7 @@ def get_user(request: Request):
 
 def authorize(request: Request):
     path = request.scope['route'].path
-    protected = path == '/dashboard' or path.startswith('/api/v1/')
+    protected = path in {'/dashboard', '/logs'} or path.startswith('/api/v1/')
     if not protected:
         return
     write = request.method not in {'GET', 'HEAD', 'OPTIONS'}
@@ -66,6 +67,13 @@ def authorize(request: Request):
         raise HTTPException(403, 'مبدأ درخواست مجاز نیست.')
     if path in PUBLIC or not request.app.state.settings.auth_required:
         return
+    if path == '/logs' and request.method == 'POST':
+        token = request.app.state.settings.http_log_token
+        scheme, _, supplied = request.headers.get('authorization', '').partition(' ')
+        if token and supplied and scheme.lower() == 'bearer' and secrets.compare_digest(
+            supplied.encode(), token.get_secret_value().encode(),
+        ):
+            return
     user = get_user(request)
     request.state.siem_user = user
     if path in SESSION_ONLY:

@@ -41,6 +41,35 @@ def test_storage_and_readback(client):
     assert client.get("/api/v1/logs/not-an-id").status_code == 422
 
 
+def test_http_logs_accept_raw_syslog_and_json(client):
+    response = client.post("/logs", content="<132>1 - router firewall - - - HTTP log",
+                           headers={"Content-Type": "text/plain; charset=utf-8"})
+    assert response.status_code == 201
+    row = response.json()
+    assert row["message"] == "HTTP log"
+    assert row["level"] == "WARNING"
+    assert row["attributes"]["transport"] == "HTTP"
+    assert row["attributes"]["syslog_host"] == "router"
+    assert client.get(f"/api/v1/logs/{row['id']}").json() == row
+    assert client.post("/logs", json=event()).status_code == 201
+    assert client.post("/logs", content=b"\xff").status_code == 422
+    assert client.post("/logs", content=b"x" * (2 * 1024 * 1024 + 1)).status_code == 413
+    assert client.get("/logs").status_code == 405
+
+
+def test_http_log_token_is_limited_to_ingestion(client, monkeypatch):
+    from pydantic import SecretStr
+
+    settings = client.app.state.settings
+    monkeypatch.setattr(settings, "auth_required", True)
+    monkeypatch.setattr(settings, "http_log_token", SecretStr("test-ingestion-token"))
+    assert client.post("/logs", content="no token").status_code == 401
+    assert client.post("/logs", content="invalid", headers={"Authorization": "Bearer invalid"}).status_code == 401
+    headers = {"Authorization": "Bearer test-ingestion-token"}
+    assert client.post("/logs", content="valid", headers=headers).status_code == 201
+    assert client.get("/api/v1/logs", headers=headers).status_code == 401
+
+
 def test_batch_filter_and_pagination(client):
     response = client.post("/api/v1/logs/batch", json={"events": [event(), event(source="router", level="INFO")]})
     assert response.status_code == 201

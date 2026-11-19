@@ -19,9 +19,9 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from starlette.concurrency import run_in_threadpool
 
-from app.api.logs import router
+from app.api.logs import http_ingestion_router, router
 from app.core.config import Settings
-from app.models.log import COLLECTION
+from app.models.log import COLLECTION, RETENTION_SECONDS
 from app.services.access import initialize_access
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
@@ -69,6 +69,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 collection.create_index(LOG_ORDER)
                 collection.create_index([("source", 1), ("timestamp", -1)])
                 collection.create_index([("level", 1), ("timestamp", -1)])
+                collection.create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database.siem_alerts.create_index([("status", 1), ("severity", 1), ("created_at", -1)])
                 app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
                 app.state.database.siem_rules.create_index("enabled")
@@ -91,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.import_lock = Lock()
     app.include_router(access.router)
     app.include_router(router)
+    app.include_router(http_ingestion_router)
     app.include_router(datasets_router)
     app.include_router(normalization_router)
     app.include_router(standardization_router)

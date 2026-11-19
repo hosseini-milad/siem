@@ -1,4 +1,4 @@
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,5 +14,6 @@ class Settings(BaseSettings):
     ml_threads: int = Field(default=2, ge=1, le=32)
     raw_log_host: str = "127.0.0.1"
     raw_log_port: int = Field(default=0, ge=0, le=65535)
+    http_log_token: SecretStr | None = None
     auth_required: bool = True
     session_cookie_secure: bool = True

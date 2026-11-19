@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -6,6 +6,7 @@ from app.schemas.log import LogCreate
 
 
 COLLECTION = "log_events"
+RETENTION_SECONDS = int(timedelta(days=7).total_seconds())
 
 
 def log_document(event: LogCreate) -> dict[str, Any]:
