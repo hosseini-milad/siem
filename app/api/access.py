@@ -21,7 +21,7 @@ router = APIRouter(prefix='/api/v1', tags=['Access'])
 Username = Annotated[str, Field(min_length=3, max_length=64, pattern=r'^[A-Za-z0-9_.-]+$')]
 Password = Annotated[SecretStr, Field(min_length=12, max_length=128)]
 Section = Literal['overview', 'ingestion', 'events', 'explorer', 'detections', 'alerts', 'incidents',
-                  'analytics', 'current-model', 'system', 'device-health', 'users', 'tasks', 'task-columns']
+                  'analytics', 'current-model', 'system', 'systems', 'device-health', 'users', 'tasks', 'task-columns']
 Grants = dict[Section, Literal['read', 'write']]
 
 PUBLIC = {'/api/v1/health', '/api/v1/auth/login', '/api/v1/auth/logout'}
@@ -37,7 +37,7 @@ PREFIX = {
     'overview': 'overview', 'dashboard': 'overview', 'logs': 'ingestion', 'ingestion': 'ingestion',
     'search': 'events', 'explorer': 'explorer', 'detections': 'detections', 'alerts': 'alerts',
     'incidents': 'incidents', 'datasets': 'analytics', 'normalization': 'analytics',
-    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'systems': 'users',
+    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'systems': 'systems',
     'users': 'users', 'device-health': 'device-health', 'tasks': 'tasks', 'task-columns': 'task-columns',
 }
 
@@ -289,7 +289,9 @@ def with_branches(database, rows):
         system = systems.get(source.get('system_id'))
         if not system:
             continue
-        manual = source.get('system') or {}
+        stored_profile = source.get('system') or {}
+        manual = {key: stored_profile[key] for key in ('name', 'ip', 'type', 'threshold')
+                  if key in stored_profile and stored_profile[key] is not None and stored_profile[key] != ''}
         last_seen = system.get('last_seen')
         account['system'] = {
             'id': system['_id'], 'mac': system['mac'], 'name': system.get('hostname') or system.get('agent_id'),
@@ -329,17 +331,29 @@ def system_scope(user, database):
 @router.get('/systems')
 def systems(user: User, database: DB, response: Response,
             limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)):
-    if user['role'] != 'manager' and not allowed(user, 'users'):
+    if not allowed(user, 'systems'):
         raise HTTPException(403, 'دسترسی به فهرست سیستم‌ها مجاز نیست.')
     scope = system_scope(user, database)
     rows = list(database.systems.find(scope).sort([('hostname', 1), ('mac', 1)]).skip(offset).limit(limit))
     assignments = {row['system_id']: row for row in database.users.find(
         {'system_id': {'$in': [item['_id'] for item in rows]}}, {'name': 1, 'system_id': 1})}
     response.headers['Cache-Control'] = 'no-store'
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
     return {'items': [{
         'id': row['_id'], 'mac': row['mac'], 'hostname': row.get('hostname') or row.get('agent_id'),
         'os': ' '.join(filter(None, [row.get('os_name'), row.get('os_release'), row.get('os_version')])),
+        'architecture': row.get('architecture'), 'processor': row.get('processor'),
+        'cpu_cores_physical': row.get('cpu_cores_physical'), 'cpu_cores_logical': row.get('cpu_cores_logical'),
+        'total_ram_gb': row.get('total_ram_gb'), 'total_disk_c_gb': row.get('total_disk_c_gb'),
+        'cpu_percent': row.get('cpu_percent'), 'memory_percent': row.get('memory_percent'),
+        'memory_used_mb': row.get('memory_used_mb'),
+        'disk_read_bytes_per_sec': row.get('disk_read_bytes_per_sec'),
+        'disk_write_bytes_per_sec': row.get('disk_write_bytes_per_sec'),
+        'net_sent_bytes_per_sec': row.get('net_sent_bytes_per_sec'),
+        'net_recv_bytes_per_sec': row.get('net_recv_bytes_per_sec'),
+        'source_ip': row.get('source_ip'), 'first_seen': row.get('first_seen'),
         'last_seen': row.get('last_seen'),
+        'online': bool(row.get('last_seen') and row['last_seen'] > cutoff),
         'assigned_user': ({'id': assignments[row['_id']]['_id'], 'name': assignments[row['_id']]['name']}
                           if row['_id'] in assignments else None),
     } for row in rows], 'total': database.systems.count_documents(scope), 'limit': limit, 'offset': offset}

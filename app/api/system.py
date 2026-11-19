@@ -42,7 +42,8 @@ def navigation(request: Request, response: Response):
     menus = [{'id': key, 'label': label, 'tags': tags} for key, label, tags in MENUS]
     if user:
         response.headers['Cache-Control'] = 'no-store'
-        for key, parent in (('explorer', 'events'), ('current-model', 'analytics'), ('device-health', 'system'), ('users', 'system')):
+        for key, parent in (('explorer', 'events'), ('current-model', 'analytics'), ('systems', 'system'),
+                            ('device-health', 'system'), ('users', 'system')):
             index = next(i for i, menu in enumerate(menus) if menu['id'] == parent)
             menus.insert(index + 1, {'id': key, 'label': SECTIONS[key], 'parent': parent, 'tags': []})
         menus.extend([

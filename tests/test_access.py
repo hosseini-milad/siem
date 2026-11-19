@@ -59,7 +59,7 @@ def test_roles_grants_and_session_revocation(application):
     assert admin.post('/api/v1/alerts/from-predictions').status_code == 403
     assert admin.get('/api/v1/logs').status_code == 403
     assert admin.get('/api/v1/explorer/records').status_code == 403
-    assert {row['id'] for row in admin.get('/api/v1/system/navigation').json()['menus']} == {'users', 'alerts', 'tasks'}
+    assert {row['id'] for row in admin.get('/api/v1/system/navigation').json()['menus']} == {'users', 'systems', 'alerts', 'tasks'}
     payload = {'username': 'endpoint', 'name': 'Endpoint', 'password': PASSWORD, 'device_id': 'soc'}
     assert admin.post('/api/v1/users', json={**payload, 'permissions': {'system': 'write'}}).status_code == 403
     assert admin.post('/api/v1/users', json={**payload, 'device_id': None}).status_code == 422
@@ -74,7 +74,7 @@ def test_roles_grants_and_session_revocation(application):
     assert manager.patch(target, json={'permissions': {'device-health': 'write'}}).status_code == 404
     assert admin.patch(target, json={'permissions': {'device-health': 'read'}}).status_code == 403
     assert manager.patch(target, json={'permissions': {'device-health': 'read'}}).status_code == 200
-    assert [row['id'] for row in client.get('/api/v1/system/navigation').json()['menus']] == ['device-health', 'tasks']
+    assert [row['id'] for row in client.get('/api/v1/system/navigation').json()['menus']] == ['device-health', 'systems', 'tasks']
     assert admin.patch(target, json={'active': False}).status_code == 200
     assert client.get('/api/v1/auth/me').status_code == 401
     assert login(client, 'endpoint').status_code == 401
@@ -159,12 +159,23 @@ def test_discovered_system_can_be_assigned_and_supplies_live_health(application)
     assert admin.post('/api/v1/users', json={
         'username': 'other', 'name': 'Other', 'password': PASSWORD, 'system_id': mac,
     }).status_code == 409
+    app.state.database.users.update_one({'_id': user_id}, {'$set': {'system': {
+        'name': 'اتاق ۱۰۳', 'ip': '192.168.1.13', 'mac': '', 'os': '', 'processor': '',
+        'memory': '', 'storage': '', 'type': 'desktop', 'threshold': 70,
+    }}})
     account = admin.get('/api/v1/users').json()['items'][0]
-    assert account['system_id'] == mac and account['system']['name'] == 'DESKTOP-88EQ9K3'
+    assert account['system_id'] == mac
+    assert account['system']['name'] == 'اتاق ۱۰۳' and account['system']['ip'] == '192.168.1.13'
+    assert account['system']['mac'] == mac and account['system']['os'] == 'Windows 10'
+    assert account['system']['processor'] == 'Intel CPU'
     health = admin.get('/api/v1/device-health').json()['items'][0]
     assert health['id'] == user_id
     assert health['system']['online'] is True
     assert health['system']['cpu'] == 7.71 and health['system']['ram'] == 64.8
+    listed = admin.get('/api/v1/systems').json()['items'][0]
+    assert listed['mac'] == mac and listed['cpu_percent'] == 7.71
+    assert listed['assigned_user']['id'] == user_id
+    assert admin.patch(f'/api/v1/systems/{mac}', json={'hostname': 'changed'}).status_code == 404
     assert admin.patch(f'/api/v1/users/{user_id}', json={'system_id': None}).status_code == 200
     assert admin.get('/api/v1/users').json()['items'][0]['system_id'] is None
 

@@ -8,7 +8,8 @@ SECTIONS = {
     'overview': 'نمای کلی', 'ingestion': 'ورود و پردازش', 'events': 'جست‌وجوی رویدادها',
     'explorer': 'کاوش داده‌ها', 'detections': 'قواعد تشخیص', 'alerts': 'هشدارها',
     'incidents': 'رخدادهای امنیتی', 'analytics': 'تحلیل هوشمند', 'current-model': 'مدل جاری',
-    'system': 'سامانه', 'device-health': 'سلامت سیستم‌ها', 'users': 'کاربران', 'tasks': 'تسک‌ها', 'task-columns': 'مدیریت ستون تسک‌ها',
+    'system': 'سامانه', 'systems': 'سیستم‌ها', 'device-health': 'سلامت سیستم‌ها',
+    'users': 'کاربران', 'tasks': 'تسک‌ها', 'task-columns': 'مدیریت ستون تسک‌ها',
 }
 COOKIE = 'siem_session'
 SESSION_SECONDS = 8 * 60 * 60
@@ -51,6 +52,9 @@ def public_user(user):
 def allowed(user, section, write=False):
     if user['role'] == 'manager':
         return True
+    if section == 'systems':
+        grants = user.get('permissions', {})
+        return not write and any(grants.get(key) in {'read', 'write'} for key in ('systems', 'users', 'device-health'))
     grant = user.get('permissions', {}).get(section)
     return grant == 'write' or (not write and grant == 'read')
 
