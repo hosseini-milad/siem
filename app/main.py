@@ -24,6 +24,7 @@ from app.core.config import Settings
 from app.models.log import COLLECTION
 from app.services.access import initialize_access
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
+from app.services.raw_logs import listen_for_raw_logs
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -72,7 +73,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
                 app.state.database.siem_rules.create_index("enabled")
             await run_in_threadpool(initialize)
-            yield
+            if config.raw_log_port:
+                async with listen_for_raw_logs(app.state.database, config.raw_log_host, config.raw_log_port):
+                    yield
+            else:
+                yield
         finally:
             client.close()
 
