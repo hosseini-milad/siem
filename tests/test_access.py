@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -130,6 +131,42 @@ def test_branch_hierarchy_and_system_profiles(application):
     assert login(client, 'new-host').status_code == 200
     assert [row['id'] for row in client.get('/api/v1/device-health').json()['items']] == [east]
     assert client.patch(f'/api/v1/device-health/{east}', json=profile).status_code == 403
+
+
+def test_discovered_system_can_be_assigned_and_supplies_live_health(application):
+    manager, app = application
+    login(manager, 'manager')
+    manager.post('/api/v1/users', json={
+        'username': 'operator', 'name': 'Operator', 'password': PASSWORD, 'branch': 'SOC',
+        'permissions': {'users': 'write', 'device-health': 'write'},
+    }).json()['id']
+    mac = '78:24:af:cb:1b:fd'
+    app.state.database.systems.insert_one({
+        '_id': mac, 'mac': mac, 'agent_id': 'DESKTOP-88EQ9K3', 'hostname': 'DESKTOP-88EQ9K3',
+        'os_name': 'Windows', 'os_release': '10', 'processor': 'Intel CPU', 'total_ram_gb': 15.89,
+        'total_disk_c_gb': 159.88, 'source_ip': '127.0.0.1', 'cpu_percent': 7.71,
+        'memory_percent': 64.8, 'last_seen': datetime.now(timezone.utc),
+    })
+    admin = TestClient(app, base_url='https://testserver')
+    assert login(admin, 'operator').status_code == 200
+    systems = admin.get('/api/v1/systems').json()['items']
+    assert systems[0]['id'] == mac and systems[0]['assigned_user'] is None
+    created = admin.post('/api/v1/users', json={
+        'username': 'analyst', 'name': 'Analyst', 'password': PASSWORD, 'system_id': mac,
+    })
+    assert created.status_code == 201, created.text
+    user_id = created.json()['id']
+    assert admin.post('/api/v1/users', json={
+        'username': 'other', 'name': 'Other', 'password': PASSWORD, 'system_id': mac,
+    }).status_code == 409
+    account = admin.get('/api/v1/users').json()['items'][0]
+    assert account['system_id'] == mac and account['system']['name'] == 'DESKTOP-88EQ9K3'
+    health = admin.get('/api/v1/device-health').json()['items'][0]
+    assert health['id'] == user_id
+    assert health['system']['online'] is True
+    assert health['system']['cpu'] == 7.71 and health['system']['ram'] == 64.8
+    assert admin.patch(f'/api/v1/users/{user_id}', json={'system_id': None}).status_code == 200
+    assert admin.get('/api/v1/users').json()['items'][0]['system_id'] is None
 
 
 def test_task_assignment_and_column_visibility(application):

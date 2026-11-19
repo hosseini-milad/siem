@@ -43,7 +43,8 @@ def avatar_url(user):
 
 def public_user(user):
     return {'id': user['_id'], **{key: user[key] for key in ('username', 'name', 'role', 'active')},
-            'device_id': user.get('device_id'), 'permissions': user.get('permissions', {}),
+            'device_id': user.get('device_id'), 'system_id': user.get('system_id'),
+            'permissions': user.get('permissions', {}),
             'branch': user.get('branch', ''), 'system': user.get('system'), 'avatar_url': avatar_url(user)}
 
 
@@ -62,6 +63,7 @@ def initialize_access(database):
     database.users.create_index('username', unique=True)
     database.users.create_index('avatar_token', unique=True, sparse=True)
     database.users.create_index('device_id', unique=True, partialFilterExpression={'device_id': {'$type': 'string'}})
+    database.users.create_index('system_id', unique=True, partialFilterExpression={'system_id': {'$type': 'string'}})
     database.users.create_index([('role', 1), ('created_by', 1), ('username', 1)])
     database.tasks.create_index([('board', 1), ('created_at', -1), ('_id', 1)])
     database.tasks.create_index([('column_id', 1), ('created_at', -1), ('_id', 1)])

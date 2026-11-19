@@ -85,6 +85,72 @@ def test_http_logs_accept_agent_json_payloads(client):
     assert unusual["attributes"]["agent_timestamp"] == "local time"
 
 
+def test_agent_payload_creates_system_metrics_events_and_change_history(client):
+    payload = {
+        "agent_id": "DESKTOP-88EQ9K3", "timestamp": "2026-11-19T11:52:23.190071",
+        "metrics": {"cpu_percent": 4.18, "memory_percent": 66.3, "memory_used_mb": 10777.1,
+                    "disk_read_bytes_per_sec": 62400.39, "disk_write_bytes_per_sec": 179017.51,
+                    "net_sent_bytes_per_sec": 1391.98, "net_recv_bytes_per_sec": 2512.19},
+        "logs": [{"log": "System", "record_number": 28766,
+                  "time": "2026-11-19T08:21:18.434923+00:00", "source": "Service Control Manager",
+                  "event_id": 7045, "type": 2, "message": "A service changed"}],
+        "system_info": {"hostname": "DESKTOP-88EQ9K3", "os_name": "Windows", "os_release": "10",
+                        "os_version": "10.0.19045", "architecture": "AMD64",
+                        "processor": "Intel CPU", "cpu_cores_physical": 4, "cpu_cores_logical": 8,
+                        "total_ram_gb": 15.89, "total_disk_c_gb": 159.88,
+                        "mac_address": "78:24:AF:CB:1B:FD"},
+    }
+    assert client.post("/logs", json=payload).status_code == 201
+    database = client.app.state.database
+    stored = database.agent_payloads.find_one({"agent_id": payload["agent_id"]})
+    assert stored["cpu_percent"] == 4.18
+    assert stored["memory_percent"] == 66.3
+    assert stored["hostname"] == "DESKTOP-88EQ9K3"
+    assert stored["mac"] == "78:24:af:cb:1b:fd"
+    assert stored["logs"][0]["event_id"] == 7045
+    assert stored["system_info"]["mac_address"] == "78:24:AF:CB:1B:FD"
+
+    mac = "78:24:af:cb:1b:fd"
+    system = database.systems.find_one(mac)
+    assert system["hostname"] == payload["agent_id"]
+    assert system["cpu_percent"] == 4.18
+    event_row = database.log_events.find_one({"attributes.agent_id": payload["agent_id"],
+                                               "attributes.event_id": 7045})
+    assert event_row["source"] == payload["agent_id"]
+    assert event_row["level"] == "WARNING"
+    assert event_row["timestamp"].isoformat() == "2026-11-19T08:21:18.434000+00:00"
+
+    changed = {**payload, "logs": [], "metrics": {**payload["metrics"], "cpu_percent": 21.5},
+               "system_info": {**payload["system_info"], "processor": "New CPU"}}
+    assert client.post("/logs", json=changed).status_code == 201
+    assert database.systems.find_one(mac)["processor"] == "New CPU"
+    history = database.system_changes.find_one({"system_id": mac})
+    assert history["changes"]["processor"] == {"before": "Intel CPU", "after": "New CPU"}
+
+    metrics_only = {"agent_id": payload["agent_id"], "metrics": {"cpu_percent": 9.25}, "logs": []}
+    assert client.post("/logs", json=metrics_only).status_code == 201
+    assert database.systems.find_one(mac)["cpu_percent"] == 9.25
+    assert database.agent_payloads.index_information()["received_at_1"]["expireAfterSeconds"] == 604800
+
+
+def test_existing_agent_wrapper_bootstraps_system(client):
+    from datetime import datetime, timezone
+    from app.services.agent_ingestion import bootstrap_systems
+
+    database = client.app.state.database
+    payload = {"agent_id": "legacy-agent", "metrics": {"cpu_percent": 12.5}, "logs": [],
+               "system_info": {"hostname": "legacy-agent", "mac_address": "00-11-22-33-44-55"}}
+    database.log_events.insert_one({
+        "_id": "legacy-wrapper", "received_at": datetime.now(timezone.utc),
+        "attributes": {"agent_payload": payload, "source_ip": "192.0.2.40", "source_port": 8080},
+    })
+    bootstrap_systems(database)
+    system = database.systems.find_one("00:11:22:33:44:55")
+    assert system["agent_id"] == "legacy-agent" and system["cpu_percent"] == 12.5
+    bootstrap_systems(database)
+    assert database.systems.count_documents({"agent_id": "legacy-agent"}) == 1
+
+
 def test_http_log_token_is_limited_to_ingestion(client, monkeypatch):
     from pydantic import SecretStr
 

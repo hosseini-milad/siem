@@ -2,7 +2,7 @@ import re
 import secrets
 from io import BytesIO
 from ipaddress import ip_address
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -37,7 +37,8 @@ PREFIX = {
     'overview': 'overview', 'dashboard': 'overview', 'logs': 'ingestion', 'ingestion': 'ingestion',
     'search': 'events', 'explorer': 'explorer', 'detections': 'detections', 'alerts': 'alerts',
     'incidents': 'incidents', 'datasets': 'analytics', 'normalization': 'analytics',
-    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'users': 'users', 'device-health': 'device-health', 'tasks': 'tasks', 'task-columns': 'task-columns',
+    'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'systems': 'users',
+    'users': 'users', 'device-health': 'device-health', 'tasks': 'tasks', 'task-columns': 'task-columns',
 }
 
 
@@ -146,6 +147,12 @@ class NewUser(BaseModel):
     permissions: Grants | None = None
     branch: Name | None = None
     system: SystemProfile | None = None
+    system_id: str | None = None
+
+    @field_validator('system_id')
+    @classmethod
+    def valid_system_id(cls, value):
+        return SystemProfile.normalize_mac(value) if value else None
 
 
 class UserUpdate(BaseModel):
@@ -156,6 +163,12 @@ class UserUpdate(BaseModel):
     system: SystemProfile | None = None
     active: bool | None = None
     permissions: Grants | None = None
+    system_id: str | None = None
+
+    @field_validator('system_id')
+    @classmethod
+    def valid_system_id(cls, value):
+        return SystemProfile.normalize_mac(value) if value else None
 
 
 def count_login_attempt(database, key, limit):
@@ -265,10 +278,71 @@ def with_branches(database, rows):
     owners = {row.get('created_by') for row in rows if row['role'] == 'client'}
     branches = {owner['_id']: owner.get('branch', '') for owner in
                 database.users.find({'_id': {'$in': list(owners)}, 'role': 'admin'}, {'branch': 1})} if owners else {}
-    return [public_user(row) | {
+    system_ids = {row.get('system_id') for row in rows if row.get('system_id')}
+    systems = {row['_id']: row for row in database.systems.find({'_id': {'$in': list(system_ids)}})} if system_ids else {}
+    result = [public_user(row) | {
         'branch': branches.get(row.get('created_by'), '') if row['role'] == 'client' else row.get('branch', ''),
         'branch_id': row.get('created_by') if row['role'] == 'client' else row['_id'],
     } for row in rows]
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    for account, source in zip(result, rows):
+        system = systems.get(source.get('system_id'))
+        if not system:
+            continue
+        manual = source.get('system') or {}
+        last_seen = system.get('last_seen')
+        account['system'] = {
+            'id': system['_id'], 'mac': system['mac'], 'name': system.get('hostname') or system.get('agent_id'),
+            'ip': system.get('source_ip', ''), 'type': system.get('type', 'desktop'),
+            'os': ' '.join(filter(None, [system.get('os_name'), system.get('os_release'), system.get('os_version')])),
+            'processor': system.get('processor', ''),
+            'architecture': system.get('architecture', ''),
+            'cpu_cores_physical': system.get('cpu_cores_physical'),
+            'cpu_cores_logical': system.get('cpu_cores_logical'),
+            'memory': f"{system['total_ram_gb']:g} GB" if isinstance(system.get('total_ram_gb'), (int, float)) else '',
+            'storage': f"{system['total_disk_c_gb']:g} GB" if isinstance(system.get('total_disk_c_gb'), (int, float)) else '',
+            'threshold': system.get('threshold', 70), 'last_seen': last_seen,
+            'online': bool(last_seen and last_seen > cutoff),
+            'cpu': system.get('cpu_percent'), 'ram': system.get('memory_percent'),
+            'disk': system.get('disk_percent'), 'memory_used_mb': system.get('memory_used_mb'),
+            'disk_read_bytes_per_sec': system.get('disk_read_bytes_per_sec'),
+            'disk_write_bytes_per_sec': system.get('disk_write_bytes_per_sec'),
+            'net_sent_bytes_per_sec': system.get('net_sent_bytes_per_sec'),
+            'net_recv_bytes_per_sec': system.get('net_recv_bytes_per_sec'),
+            **manual,
+        }
+    return result
+
+
+def system_scope(user, database):
+    if user['role'] == 'manager':
+        return {}
+    if user['role'] == 'admin':
+        own = [row['system_id'] for row in database.users.find(
+            {'role': 'client', 'created_by': user['_id'], 'system_id': {'$type': 'string'}}, {'system_id': 1})]
+        assigned = [row['system_id'] for row in database.users.find(
+            {'system_id': {'$type': 'string'}}, {'system_id': 1})]
+        return {'$or': [{'_id': {'$in': own}}, {'_id': {'$nin': assigned}}]}
+    return {'_id': user.get('system_id', '')}
+
+
+@router.get('/systems')
+def systems(user: User, database: DB, response: Response,
+            limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0)):
+    if user['role'] != 'manager' and not allowed(user, 'users'):
+        raise HTTPException(403, 'دسترسی به فهرست سیستم‌ها مجاز نیست.')
+    scope = system_scope(user, database)
+    rows = list(database.systems.find(scope).sort([('hostname', 1), ('mac', 1)]).skip(offset).limit(limit))
+    assignments = {row['system_id']: row for row in database.users.find(
+        {'system_id': {'$in': [item['_id'] for item in rows]}}, {'name': 1, 'system_id': 1})}
+    response.headers['Cache-Control'] = 'no-store'
+    return {'items': [{
+        'id': row['_id'], 'mac': row['mac'], 'hostname': row.get('hostname') or row.get('agent_id'),
+        'os': ' '.join(filter(None, [row.get('os_name'), row.get('os_release'), row.get('os_version')])),
+        'last_seen': row.get('last_seen'),
+        'assigned_user': ({'id': assignments[row['_id']]['_id'], 'name': assignments[row['_id']]['name']}
+                          if row['_id'] in assignments else None),
+    } for row in rows], 'total': database.systems.count_documents(scope), 'limit': limit, 'offset': offset}
 
 
 def account_page(database, scope, limit, offset):
@@ -330,14 +404,20 @@ def create_user(body: NewUser, user: User, database: DB):
     manager = user['role'] == 'manager'
     if not manager and body.permissions is not None:
         raise HTTPException(403, 'فقط مدیریت کل دسترسی‌ها را تعیین می‌کند.')
-    if manager and (body.device_id or body.system is not None) or not manager and body.branch is not None:
+    if manager and (body.device_id or body.system is not None or body.system_id) or not manager and body.branch is not None:
         raise HTTPException(422, 'شاخه برای ادمین و مشخصات سیستم برای کلاینت تعریف می‌شود.')
-    if not manager and body.system is None and not body.device_id:
+    if not manager and body.system is None and not body.device_id and not body.system_id:
         raise HTTPException(422, 'مشخصات سیستم یا شناسهٔ اتصال کلاینت را وارد کنید.')
+    if body.system_id:
+        if not database.systems.find_one({'_id': body.system_id, **system_scope(user, database)}):
+            raise HTTPException(404, 'سیستم انتخاب‌شده پیدا نشد.')
+        if database.users.find_one({'system_id': body.system_id}):
+            raise HTTPException(409, 'سیستم انتخاب‌شده به کاربر دیگری متصل است.')
     identity = uuid4().hex
     doc = {'_id': identity, 'username': body.username.lower(), 'name': body.name,
            'password': password_hash(body.password.get_secret_value()), 'role': 'admin' if manager else 'client',
            'permissions': body.permissions or {}, 'device_id': None if manager else body.device_id or identity,
+           'system_id': None if manager else body.system_id,
            'active': True, 'session_version': 0, 'created_by': user['_id']}
     if manager:
         doc['branch'] = body.branch or ''
@@ -357,7 +437,7 @@ def update_user(user_id: str, body: UserUpdate, user: User, database: DB):
         raise HTTPException(403, 'ویرایش حساب مجاز نیست.')
     if body.permissions is not None and user['role'] != 'manager':
         raise HTTPException(403, 'فقط مدیریت کل دسترسی‌ها را تعیین می‌کند.')
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_none=True, exclude={'system_id'})
     if body.username is not None:
         changes['username'] = body.username.lower()
     requires_admin = body.branch is not None or (body.permissions is not None and (
@@ -368,9 +448,19 @@ def update_user(user_id: str, body: UserUpdate, user: User, database: DB):
         scope = {'role': 'admin'}
     elif body.system is not None:
         scope['role'] = 'client'
-    if not changes:
+    if 'system_id' in body.model_fields_set:
+        scope['role'] = 'client'
+    if not changes and 'system_id' not in body.model_fields_set:
         raise HTTPException(422, 'تغییری برای ذخیره وارد نشده است.')
+    if body.system_id:
+        if not database.systems.find_one({'_id': body.system_id, **system_scope(user, database)}):
+            raise HTTPException(404, 'سیستم انتخاب‌شده پیدا نشد.')
+        if database.users.find_one({'system_id': body.system_id, '_id': {'$ne': user_id}}):
+            raise HTTPException(409, 'سیستم انتخاب‌شده به کاربر دیگری متصل است.')
+        changes['system_id'] = body.system_id
     update = {'$set': changes}
+    if 'system_id' in body.model_fields_set and body.system_id is None:
+        update['$unset'] = {'system_id': ''}
     if body.active is False:
         update['$inc'] = {'session_version': 1}
     try:

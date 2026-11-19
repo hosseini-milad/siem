@@ -9,6 +9,7 @@ from starlette.concurrency import run_in_threadpool
 from app.db.session import DB
 from app.schemas.log import LogBatch, LogCreate, LogLevel, LogPage, LogRead
 from app.services import logs
+from app.services.agent_ingestion import ingest_agent_payload
 from app.services.raw_logs import parse_raw_log
 
 router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
@@ -80,12 +81,14 @@ async def receive_http_log(request: Request, database: DB):
         body.extend(chunk)
 
     media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    agent_payload = None
     try:
         if media_type == "application/json":
             try:
                 event = LogCreate.model_validate_json(body)
             except ValidationError:
-                event = agent_json_event(json.loads(body), request)
+                agent_payload = json.loads(body)
+                event = agent_json_event(agent_payload, request)
         else:
             message = body.decode("utf-8").strip()
             if not 1 <= len(message) <= 65536:
@@ -98,6 +101,13 @@ async def receive_http_log(request: Request, database: DB):
     except (UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
         raise HTTPException(422, "Expected UTF-8 log text or a valid JSON log") from exc
 
+    if isinstance(agent_payload, dict):
+        source_ip = request.client.host if request.client else "http-agent"
+        source_port = request.client.port if request.client else None
+        nested = await run_in_threadpool(
+            ingest_agent_payload, database, agent_payload, source_ip, source_port, datetime.now(timezone.utc),
+        )
+        return (await run_in_threadpool(logs.store_logs, database, [event, *nested]))[0]
     return (await run_in_threadpool(logs.store_logs, database, [event]))[0]
 
 
