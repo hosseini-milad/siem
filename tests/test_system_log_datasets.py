@@ -77,6 +77,22 @@ def test_streams_json_across_read_boundaries(setup):
     assert database.system_log_dataset_records.find_one({"event_id": 10})["message"] == long_message
 
 
+def test_csv_empty_and_duplicate_headers_are_root_fields(setup):
+    client, folder, database = setup
+    (folder / "headers.csv").write_text(
+        ",event_id,event_id,   \nrow-index,100,duplicate-value,trailing-value\n", encoding="utf-8")
+
+    status = import_status(client, str(folder / "headers.csv"))
+    assert status["status"] == "completed", status
+    row = database.system_log_dataset_records.find_one()
+    assert row["unnamed_column_1"] == "row-index"
+    assert row["event_id"] == "100"
+    assert row["event_id_2"] == "duplicate-value"
+    assert row["unnamed_column_4"] == "trailing-value"
+    assert "record" not in row
+    assert row["_import"]["format"] == "csv"
+
+
 def test_rejects_outside_missing_and_invalid_paths(setup, tmp_path):
     client, folder, database = setup
     (folder / "valid.jsonl").write_text('{"ok":true}\n', encoding="utf-8")

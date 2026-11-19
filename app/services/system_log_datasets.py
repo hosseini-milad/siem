@@ -111,10 +111,20 @@ def records(path: Path):
     if kind == "csv":
         with open_text(path, newline="") as stream:
             reader = csv.DictReader(stream, strict=True)
-            if not reader.fieldnames or any(not key or not key.strip() for key in reader.fieldnames):
-                raise ValueError("CSV requires nonempty column names")
-            if len(set(reader.fieldnames)) != len(reader.fieldnames):
-                raise ValueError("CSV requires unique column names")
+            if not reader.fieldnames:
+                raise ValueError("CSV requires a header row")
+            names = []
+            used = set()
+            for position, original in enumerate(reader.fieldnames, 1):
+                base = original if original and original.strip() else f"unnamed_column_{position}"
+                name = base
+                duplicate = 2
+                while name in used:
+                    name = f"{base}_{duplicate}"
+                    duplicate += 1
+                names.append(name)
+                used.add(name)
+            reader.fieldnames = names
             yield from reader
     elif kind in {"json", "jsonl", "ndjson"}:
         with open_text(path) as stream:
