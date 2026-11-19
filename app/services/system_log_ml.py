@@ -29,7 +29,9 @@ NORMAL_RUNS = "system_log_normalization_runs"
 TRAINING_RUNS = "system_log_training_runs"
 MODELS = "system_log_models"
 MODEL_FILES = "system_log_model_files"
-NORMALIZATION_VERSION = 1
+NORMALIZATION_VERSION = 2
+NORMAL_PARAMETERS = "system_log_normalization_parameters"
+SCALER_ID = f"minmax-v{NORMALIZATION_VERSION}"
 HASH_BUCKETS = 128
 BATCH_SIZE = 500
 
@@ -129,12 +131,17 @@ def category_text(value):
     return value
 
 
-def numeric(value, kind, scale):
+def finite_number(value):
     try:
         number = float(text(value))
     except (TypeError, ValueError, OverflowError):
-        return 0.0
-    if not math.isfinite(number) or number <= 0:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def numeric(value, kind, scale):
+    number = finite_number(value)
+    if number is None or number <= 0:
         return 0.0
     if kind == "linear":
         return min(number / scale, 1.0)
@@ -156,17 +163,63 @@ def hour_features(value):
     return (math.sin(angle) + 1) / 2, (math.cos(angle) + 1) / 2
 
 
-def normalize_row(row, require_label=True):
+def minmax(value, bounds):
+    number = finite_number(value)
+    if number is None or bounds is None:
+        return 0.0
+    lower, upper = bounds
+    if lower == upper or number <= lower:
+        return 0.0
+    if number >= upper:
+        return 1.0
+    if math.isinf(upper - lower):
+        return (number / 2 - lower / 2) / (upper / 2 - lower / 2)
+    return (number - lower) / (upper - lower)
+
+
+def normalization_bounds(database, job_id):
+    parameters = database[NORMAL_PARAMETERS]
+    existing = parameters.find_one({"_id": SCALER_ID})
+    if existing is not None:
+        return existing["numeric_bounds"]
+
+    projection = {alias: 1 for aliases, _, _ in NUMERIC.values() for alias in aliases}
+    bounds = {}
+    database[NORMAL_RUNS].update_one({"_id": job_id}, {"$set": {"phase": "fit_minmax"}})
+    with database[SOURCE].find({}, projection).batch_size(BATCH_SIZE) as cursor:
+        for scanned, row in enumerate(cursor, 1):
+            for name, (aliases, _, _) in NUMERIC.items():
+                value = finite_number(first(row, aliases))
+                if value is not None:
+                    lower, upper = bounds.get(name, (value, value))
+                    bounds[name] = [min(lower, value), max(upper, value)]
+            if scanned % 10000 == 0:
+                database[NORMAL_RUNS].update_one({"_id": job_id}, {"$set": {
+                    "fit_scanned": scanned, "heartbeat_at": datetime.now(timezone.utc),
+                }})
+    if not bounds:
+        raise ValueError("The source collection has no usable numeric features")
+    parameters.update_one({"_id": SCALER_ID}, {"$setOnInsert": {
+        "version": NORMALIZATION_VERSION, "features": FEATURES, "numeric_bounds": bounds,
+        "hash_buckets": HASH_BUCKETS, "updated_at": datetime.now(timezone.utc),
+    }}, upsert=True)
+    return parameters.find_one({"_id": SCALER_ID})["numeric_bounds"]
+
+
+def normalize_row(row, require_label=True, bounds=None):
     label = text(row.get("Label"))
     missing_label = not label or label.casefold() in {"nan", "none", "null", "unknown", "unlabeled"}
     if require_label and missing_label:
         raise ValueError("Every source row requires a usable Label")
-    result = {"_id": row["_id"], "original_id": row["_id"],
-              "normalization_version": NORMALIZATION_VERSION}
+    identifier = row.get("_id")
+    result = {"_id": identifier, "original_id": identifier,
+              "normalization_version": 1 if bounds is None else NORMALIZATION_VERSION}
     if not missing_label:
         result["Label"] = label
     for output, (aliases, kind, scale) in NUMERIC.items():
-        result[output] = numeric(first(row, aliases), kind, scale)
+        value = first(row, aliases)
+        result[output] = (numeric(value, kind, scale) if bounds is None
+                          else minmax(value, bounds.get(output)))
     for output, aliases in BOOLEAN.items():
         result[output] = boolean(first(row, aliases))
     result["time_hour_sin"], result["time_hour_cos"] = hour_features(
@@ -190,9 +243,11 @@ def normalize_dataset(database, job_id):
         database[NORMAL].create_index("original_id", unique=True)
         database[NORMAL].create_index([("normalization_version", 1), ("Label", 1)])
         database[NORMAL_RUNS].update_one({"_id": job_id}, {"$set": {
-            "phase": "transform", "total_estimate": total, "started_at": datetime.now(timezone.utc),
+            "phase": "starting", "normalization_version": NORMALIZATION_VERSION, "total_estimate": total, "started_at": datetime.now(timezone.utc),
             "heartbeat_at": datetime.now(timezone.utc), "worker_pid": os.getpid(),
         }})
+        bounds = normalization_bounds(database, job_id)
+        database[NORMAL_RUNS].update_one({"_id": job_id}, {"$set": {"phase": "transform"}})
         batch = []
         reported = monotonic()
 
@@ -207,7 +262,7 @@ def normalize_dataset(database, job_id):
                     skipped += 1
                     continue
                 try:
-                    normalized = normalize_row(row)
+                    normalized = normalize_row(row, bounds=bounds)
                 except ValueError:
                     failed += 1
                     continue
@@ -225,17 +280,14 @@ def normalize_dataset(database, job_id):
                             processed + skipped + failed, total)
                 reported = monotonic()
 
-        for row in database[SOURCE].find().batch_size(BATCH_SIZE):
-            batch.append(row)
-            if len(batch) == BATCH_SIZE:
-                consume(batch)
-                batch = []
+        with database[SOURCE].find().batch_size(BATCH_SIZE) as cursor:
+            for row in cursor:
+                batch.append(row)
+                if len(batch) == BATCH_SIZE:
+                    consume(batch)
+                    batch = []
         if batch:
             consume(batch)
-        database.system_log_normalization_parameters.replace_one({"_id": "default"}, {
-            "_id": "default", "version": NORMALIZATION_VERSION, "features": FEATURES,
-            "hash_buckets": HASH_BUCKETS, "updated_at": datetime.now(timezone.utc),
-        }, upsert=True)
         database[NORMAL_RUNS].update_one({"_id": job_id}, {"$set": {
             "status": "completed", "phase": "done", "processed": processed, "skipped": skipped,
             "failed": failed, "finished_at": datetime.now(timezone.utc),
@@ -256,6 +308,35 @@ def label_sort(value):
         return 1, value
 
 
+def dataset_statistics(database, top_event_pairs):
+    pipeline = [
+        {"$project": {
+            "label": {"$trim": {"input": {"$convert": {
+                "input": "$Label", "to": "string", "onError": "", "onNull": "",
+            }}}},
+            "event_id": {"$convert": {
+                "input": "$EventID", "to": "string", "onError": None, "onNull": None,
+            }},
+        }},
+        {"$group": {"_id": {"label": "$label", "event_id": "$event_id"}, "count": {"$sum": 1}}},
+        {"$facet": {
+            "label_counts": [
+                {"$group": {"_id": "$_id.label", "count": {"$sum": "$count"}}},
+                {"$sort": {"count": -1, "_id": 1}},
+                {"$project": {"_id": 0, "label": "$_id", "count": 1}},
+            ],
+            "top_label_events": [
+                {"$sort": {"count": -1, "_id.label": 1, "_id.event_id": 1}},
+                {"$limit": top_event_pairs},
+                {"$project": {"_id": 0, "label": "$_id.label", "event_id": "$_id.event_id", "count": 1}},
+            ],
+        }},
+    ]
+    with database[SOURCE].aggregate(pipeline, allowDiskUse=True) as cursor:
+        result = next(cursor)
+    return {"total": sum(row["count"] for row in result["label_counts"]), **result}
+
+
 def class_counts(database):
     rows = database[NORMAL].aggregate([
         {"$match": {"normalization_version": NORMALIZATION_VERSION}},
@@ -274,37 +355,42 @@ def sample_training_rows(database, max_records, random_seed, progress=None):
     if per_class < 20:
         raise ValueError("At least 20 normalized records per label are required")
     projection = {name: 1 for name in FEATURES} | {"Label": 1, "original_id": 1}
-    sampled = []
+    values = np.empty((per_class * len(labels), len(FEATURES)), dtype=np.float32)
+    targets = np.repeat(np.arange(len(labels), dtype=np.int32), per_class)
     scanned = 0
-    for label in labels:
+    for class_index, label in enumerate(labels):
         seed = random_seed + int.from_bytes(sha256(label.encode()).digest()[:4], "big")
         rng = random.Random(seed)
-        reservoir = []
-        cursor = database[NORMAL].find({
-            "normalization_version": NORMALIZATION_VERSION, "Label": label}, projection).batch_size(1000)
-        for index, row in enumerate(cursor):
-            if len(reservoir) < per_class:
-                reservoir.append(row)
-            else:
-                slot = rng.randrange(index + 1)
+        start = class_index * per_class
+        seen = 0
+        with database[NORMAL].find({
+            "normalization_version": NORMALIZATION_VERSION, "Label": label}, projection).batch_size(1000) as cursor:
+            for index, row in enumerate(cursor):
+                slot = index if index < per_class else rng.randrange(index + 1)
                 if slot < per_class:
-                    reservoir[slot] = row
-            scanned += 1
-            if progress and scanned % 10000 == 0:
-                progress(scanned, counts, per_class)
-        sampled.extend(reservoir)
-    random.Random(random_seed).shuffle(sampled)
+                    values[start + slot] = [row.get(name, 0.0) for name in FEATURES]
+                seen += 1
+                scanned += 1
+                if progress and scanned % 10000 == 0:
+                    progress(scanned, counts, per_class)
+        if seen < per_class:
+            raise ValueError("Normalized records changed during training sampling")
     if progress:
         progress(scanned, counts, per_class)
-    return sampled, labels, counts, per_class
+    validate_matrix(values)
+    return values, targets, labels, counts, per_class
 
 
-def matrix(rows):
-    result = np.asarray([[row.get(name, 0.0) for name in FEATURES] for row in rows], dtype=np.float32)
+def validate_matrix(result):
     if result.ndim != 2 or result.shape[1] != len(FEATURES) or not np.isfinite(result).all():
         raise ValueError("Normalized features must be a finite numeric matrix")
     if (result < 0).any() or (result > 1).any():
         raise ValueError("Normalized features must remain between zero and one")
+
+
+def matrix(rows):
+    result = np.asarray([[row.get(name, 0.0) for name in FEATURES] for row in rows], dtype=np.float32)
+    validate_matrix(result)
     return result
 
 
@@ -372,7 +458,8 @@ class SystemLogPredictor:
     def predict(self, records):
         if not records:
             return []
-        normalized = [normalize_row(row, require_label=False) for row in records]
+        bounds = self.manifest.get("numeric_bounds")
+        normalized = [normalize_row(row, require_label=False, bounds=bounds) for row in records]
         values = matrix(normalized)
         classes = len(self.manifest["labels"])
         light_values = probabilities(self.light, values, classes)
@@ -461,18 +548,21 @@ def train_models(database, job_id, max_records, rounds, random_seed, threads=2, 
                 "heartbeat_at": datetime.now(timezone.utc),
             }})
 
-        rows, class_names, counts, per_class = sample_training_rows(
+        parameters = database[NORMAL_PARAMETERS].find_one({"_id": SCALER_ID})
+        completed = database[NORMAL_RUNS].find_one({
+            "status": "completed", "normalization_version": NORMALIZATION_VERSION,
+        }, {"_id": 1})
+        if parameters is None or completed is None:
+            raise ValueError("Run Sysmon normalization before training")
+        values, targets, class_names, counts, per_class = sample_training_rows(
             database, max_records, random_seed, progress)
-        values = matrix(rows)
-        mapping = {label: index for index, label in enumerate(class_names)}
-        targets = np.asarray([mapping[row["Label"]] for row in rows], dtype=np.int32)
         x_train_valid, x_test, y_train_valid, y_test = train_test_split(
             values, targets, test_size=0.2, random_state=random_seed, stratify=targets)
         x_train, x_validation, y_train, y_validation = train_test_split(
             x_train_valid, y_train_valid, test_size=0.2, random_state=random_seed, stratify=y_train_valid)
         classes = len(class_names)
         database[TRAINING_RUNS].update_one({"_id": job_id}, {"$set": {
-            "phase": "training", "sampled": len(rows), "labels": class_names,
+            "phase": "training", "sampled": len(targets), "labels": class_names,
             "split": {"train": len(y_train), "validation": len(y_validation), "test": len(y_test)},
         }})
         objective = "binary" if classes == 2 else "multiclass"
@@ -522,6 +612,7 @@ def train_models(database, job_id, max_records, rounds, random_seed, threads=2, 
         manifest = {
             "version": 1, "normalization_version": NORMALIZATION_VERSION,
             "features": FEATURES, "labels": class_names,
+            "numeric_bounds": parameters["numeric_bounds"],
             "ensemble": {"lightgbm_weight": light_weight, "catboost_weight": 1 - light_weight},
         }
         package = model_package(light, cat, manifest)
@@ -534,8 +625,8 @@ def train_models(database, job_id, max_records, rounds, random_seed, threads=2, 
             "feature_weights": weights, "evaluation": reports,
             "ensemble": {"lightgbm_weight": light_weight, "catboost_weight": 1 - light_weight,
                          "validation_log_loss": validation_loss},
-            "source": {"collection": NORMAL, "class_counts": counts,
-                       "sample_per_class": per_class, "sampled": len(rows)},
+            "source": {"collection": NORMAL, "scaler_id": SCALER_ID, "class_counts": counts,
+                       "sample_per_class": per_class, "sampled": len(targets)},
             "split": {"train": len(y_train), "validation": len(y_validation), "test": len(y_test)},
             "acceptance": {"accepted": accepted, "baseline_accuracy": baseline,
                            "policy": "ensemble accuracy and macro-F1 must exceed balanced random baseline"},

@@ -200,15 +200,17 @@ Content-Type: application/json
 
 ### نرمال‌سازی و مدل تشخیص Label لاگ سیستم
 
-گردش‌کار Sysmon مستقل از مدل ترافیک شبکه است و از بخش **تحلیل هوشمند** پنل یا APIهای زیر اجرا می‌شود:
+گردش‌کار Sysmon از بخش **تحلیل هوشمند** پنل یا تگ **Sysmon Dataset & ML** در Swagger اجرا می‌شود. اکشن `GET /api/v1/system-log-ml/dataset/statistics` آمار خام را برمی‌گرداند. پارامتر اختیاری `top_event_pairs` بین ۱ و ۱۰۰ است و پیش‌فرض آن ۳۰ است. پاسخ شامل `total`، `label_counts` و `top_label_events` است. Label خالی یعنی مقدار غایب، خالی یا تبدیل‌ناپذیر.
 
-1. `POST /api/v1/system-log-ml/normalization/runs` رکوردهای جدید `system_log_dataset_records` را به‌صورت جریانی نرمال و در `system_log_dataset_normal` upsert می‌کند. با `GET /api/v1/system-log-ml/normalization/runs/{id}` پیشرفت را ببینید.
+در Swagger، اکشن نرمال‌سازی بدنه ندارد. نمونهٔ بدنهٔ آموزش `{"max_records":200000,"rounds":300,"random_seed":42}` است. هر دو اکشن با HTTP 202 و شناسهٔ اجرا پاسخ می‌دهند.
+
+1. `POST /api/v1/system-log-ml/normalization/runs` در نخستین اجرای نسخهٔ ۲ کمینه و بیشینهٔ فیلدهای عددی را با پیمایش جریانی `system_log_dataset_records` محاسبه می‌کند. سپس رکوردهای جدید یا متعلق به نسخهٔ قبلی را در `system_log_dataset_normal` به‌صورت دسته‌ای upsert می‌کند. با `GET /api/v1/system-log-ml/normalization/runs/{id}` پیشرفت را ببینید.
 2. `GET /api/v1/system-log-ml/labels` تعداد رکوردهای آماده برای هر Label را نشان می‌دهد.
 3. `POST /api/v1/system-log-ml/training/runs` یک نمونهٔ متوازن و قابل تنظیم تا `max_records` می‌سازد، آن را به train، validation و test مستقل تقسیم می‌کند و LightGBM و CatBoost را آموزش می‌دهد. وزن Ensemble فقط با validation انتخاب می‌شود و ارزیابی نهایی از test است.
 4. `GET /api/v1/system-log-ml/training/runs/{id}` معیارها، ماتریس خطا و وزن ویژگی‌ها را برمی‌گرداند. مدل پذیرفته‌شده از `GET /api/v1/system-log-ml/models/current` و تاریخچه از `/models` قابل مشاهده است.
 5. `POST /api/v1/system-log-ml/predict` برای آزمایش پیش‌بینی روی لاگ خام است. پس از فعال‌شدن مدل، رویدادهای جدید Agent هنگام ورود خودکار امتیاز می‌گیرند.
 
-نرمال‌سازی از شناسهٔ ردیف، `_import` و Label به‌عنوان feature استفاده نمی‌کند. فیلدهای عددی و Boolean با قرارداد ثابت به بازهٔ صفر تا یک می‌روند و رشته‌های پرتنوع مانند GUID، مسیر فایل، CommandLine، IP و Hash با ۱۲۸ Feature Hash ثابت تبدیل می‌شوند؛ بنابراین همان تبدیل روی `agent_logs` بدون Fit مجدد قابل اعمال است. Label می‌تواند دودویی یا چندکلاسه مانند `0`، `1` و `2` باشد. نمونه‌گیری آموزش برای جلوگیری از غلبهٔ کلاس بزرگ‌تر متوازن است، پس معیار test کیفیت روی نمونهٔ متوازن را نشان می‌دهد و با نرخ واقعی رخدادها یکسان فرض نمی‌شود.
+نرمال‌سازی از شناسهٔ ردیف، `_import` و Label به‌عنوان feature استفاده نمی‌کند. فیلدهای عددی با Min–Max به بازهٔ صفر تا یک می‌روند. مقدار نامعتبر یا ستون ثابت به صفر تبدیل می‌شود و مقدار خارج از محدوده تا مرز بازه محدود می‌شود. حدود در `system_log_normalization_parameters` ذخیره می‌شوند و اجرای افزایشی همان حدود را به‌کار می‌برد. پرچم‌ها دودویی‌اند و رشته‌های پرتنوع مانند GUID، مسیر فایل، CommandLine، IP و Hash به ۱۲۸ سطل هش نگاشت می‌شوند. مدل نسخهٔ ۲ حدود نرمال‌سازی را در manifest نگه می‌دارد تا همان تبدیل روی `agent_logs` اعمال شود. مدل‌های قبلی مقیاس اولیهٔ خود را حفظ می‌کنند. Label می‌تواند دودویی یا چندکلاسه مانند `0`، `1` و `2` باشد. آموزش به حداقل دو کلاس و ۲۰ رکورد نرمال‌شده در هر کلاس نیاز دارد. پیش‌فرض `max_records` برابر ۲۰۰ هزار و حداکثر آن یک میلیون است. نمونهٔ متوازن در آرایهٔ float32 نگهداری می‌شود. معیار test روی نمونهٔ متوازن محاسبه می‌شود و حدود Min–Max از کل مجموعهٔ مبدأ به دست می‌آیند.
 
 metadata، وزن ویژگی‌ها، تقسیم داده و ارزیابی در `system_log_models` ذخیره می‌شود. فایل کامل و فشردهٔ LightGBM، CatBoost و manifest در GridFS با bucket `system_log_model_files` قرار می‌گیرد تا محدودیت ۱۶ مگابایت سند MongoDB نقض نشود. فقط مدلی فعال می‌شود که Accuracy و Macro-F1 آن از خط مبنای تصادفی متوازن بهتر باشند. برای هر `agent_logs` جدید، `predicted_label`، `prediction_confidence`، احتمال همهٔ کلاس‌ها، `model_id` و `predicted_at` در همان سند ثبت می‌شود.
 

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import UUID, uuid4
 
 from bson import ObjectId
@@ -7,17 +8,40 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.db.session import DB
 from app.services.system_log_ml import (MODELS, NORMAL, NORMAL_RUNS, NORMALIZATION_VERSION,
-                                        TRAINING_RUNS, class_counts, normalize_dataset,
+                                        SOURCE, TRAINING_RUNS, class_counts, dataset_statistics, normalize_dataset,
                                         train_models)
 
-router = APIRouter(prefix="/api/v1/system-log-ml", tags=["Machine Learning"])
+TAG = {"name": "Sysmon Dataset & ML",
+       "description": "آمار دیتاست خام، نرمال‌سازی Min–Max، آموزش و بررسی مدل لاگ سیستم."}
+router = APIRouter(prefix="/api/v1/system-log-ml", tags=[TAG["name"]])
+
+
+class LabelCount(BaseModel):
+    label: str
+    count: int
+
+
+class LabelEventCount(LabelCount):
+    event_id: str | None
+
+
+class DatasetStatistics(BaseModel):
+    source_collection: Literal["system_log_dataset_records"]
+    total: int
+    label_counts: list[LabelCount]
+    top_label_events: list[LabelEventCount]
+
+
+class JobReceipt(BaseModel):
+    id: UUID
+    status: Literal["running"]
 
 
 class TrainingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    max_records: int = Field(default=200000, ge=100, le=1000000)
-    rounds: int = Field(default=300, ge=10, le=2000)
-    random_seed: int = Field(default=42, ge=0, le=2147483647)
+    max_records: int = Field(default=200000, ge=100, le=1000000, description="سقف تعداد نمونه‌های متوازن آموزش")
+    rounds: int = Field(default=300, ge=10, le=2000, description="سقف تعداد دور آموزش هر مدل")
+    random_seed: int = Field(default=42, ge=0, le=2147483647, description="بذر نمونه‌گیری و تقسیم داده")
 
 
 class PredictRequest(BaseModel):
@@ -30,8 +54,17 @@ def acquire(request):
         raise HTTPException(409, "Another import, normalization or training operation is running")
 
 
-@router.post("/normalization/runs", status_code=202,
-             summary="نرمال‌سازی دیتاست برچسب‌دار Sysmon")
+@router.get("/dataset/statistics", response_model=DatasetStatistics,
+            summary="آمار دیتاست خام Sysmon",
+            description="تعداد کل، تعداد هر Label و پرتکرارترین ترکیب‌های Label و EventID را برمی‌گرداند.")
+def raw_dataset_statistics(database: DB, top_event_pairs: int = Query(
+        30, ge=1, le=100, description="حداکثر تعداد ترکیب‌های Label و EventID در پاسخ")):
+    return {"source_collection": SOURCE, **dataset_statistics(database, top_event_pairs)}
+
+
+@router.post("/normalization/runs", status_code=202, response_model=JobReceipt,
+             summary="شروع نرمال‌سازی Min–Max دیتاست Sysmon",
+             description="تمام رکوردهای واجد شرایط را پردازش می‌کند. شناسهٔ پاسخ را در اکشن وضعیت نرمال‌سازی وارد کنید.")
 def start_normalization(request: Request, tasks: BackgroundTasks, database: DB):
     acquire(request)
     job_id = str(uuid4())
@@ -66,8 +99,9 @@ def normalization_status(run_id: UUID, database: DB):
 @router.get("/normalization/records", summary="نمونه داده‌های نرمال‌شده Sysmon")
 def normalized_records(database: DB, limit: int = Query(20, ge=1, le=100),
                        offset: int = Query(0, ge=0, le=100000)):
-    return {"items": list(database[NORMAL].find().sort("_id", 1).skip(offset).limit(limit)),
-            "total": database[NORMAL].count_documents({}), "limit": limit, "offset": offset}
+    query = {"normalization_version": NORMALIZATION_VERSION}
+    return {"items": list(database[NORMAL].find(query).sort("_id", 1).skip(offset).limit(limit)),
+            "total": database[NORMAL].count_documents(query), "limit": limit, "offset": offset}
 
 
 @router.get("/labels", summary="تعداد رکوردهای نرمال‌شده برای هر Label")
@@ -75,8 +109,9 @@ def labels(database: DB):
     return {"normalization_version": NORMALIZATION_VERSION, "counts": class_counts(database)}
 
 
-@router.post("/training/runs", status_code=202,
-             summary="آموزش و ارزیابی مدل Label لاگ سیستم")
+@router.post("/training/runs", status_code=202, response_model=JobReceipt,
+             summary="شروع آموزش و ارزیابی مدل لاگ سیستم",
+             description="پس از تکمیل نرمال‌سازی اجرا کنید. شناسهٔ پاسخ را در اکشن وضعیت آموزش وارد کنید.")
 def start_training(body: TrainingRequest, request: Request, tasks: BackgroundTasks, database: DB):
     acquire(request)
     job_id = str(uuid4())

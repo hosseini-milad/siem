@@ -55,6 +55,36 @@ def run_status(client, start_path, status_path, body=None):
     return result.json()
 
 
+def test_dataset_statistics_and_swagger_actions(setup):
+    client, database = setup
+    prefix = "/api/v1/system-log-ml"
+    path = prefix + "/dataset/statistics"
+    assert client.get(path).json() == {
+        "source_collection": "system_log_dataset_records", "total": 0,
+        "label_counts": [], "top_label_events": [],
+    }
+    database.system_log_dataset_records.insert_many([
+        {"Label": " 2 ", "EventID": "13"},
+        {"Label": 2, "EventID": 13},
+        {"Label": "0", "EventID": 1},
+        {},
+    ])
+    response = client.get(path, params={"top_event_pairs": 1})
+    assert response.status_code == 200
+    assert response.json() == {
+        "source_collection": "system_log_dataset_records", "total": 4,
+        "label_counts": [{"label": "2", "count": 2}, {"label": "", "count": 1}, {"label": "0", "count": 1}],
+        "top_label_events": [{"label": "2", "event_id": "13", "count": 2}],
+    }
+    assert client.get(path, params={"top_event_pairs": 101}).status_code == 422
+    schema = client.get("/openapi.json").json()
+    tag = "Sysmon Dataset & ML"
+    assert tag in {entry["name"] for entry in schema["tags"]}
+    for method, suffix in (("get", "/dataset/statistics"),
+                           ("post", "/normalization/runs"), ("post", "/training/runs")):
+        assert schema["paths"][prefix + suffix][method]["tags"] == [tag]
+
+
 def test_system_log_normalization_is_incremental_and_agent_compatible(setup):
     client, database = setup
     database.system_log_dataset_records.insert_many(source_rows())
@@ -65,7 +95,10 @@ def test_system_log_normalization_is_incremental_and_agent_compatible(setup):
     assert database.system_log_dataset_normal.count_documents({}) == 180
     row = database.system_log_dataset_normal.find_one({"original_id": "2-0000"})
     assert row["Label"] == "2" and row["normalization_version"] == NORMALIZATION_VERSION
-    assert 0 < row["num_event_id"] <= 1 and 0 <= row["num_process_id"] <= 1
+    assert row["num_event_id"] == 1 and row["num_process_id"] == 0
+    assert row["num_level"] == 0  # Constant column.
+    midpoint = database.system_log_dataset_normal.find_one({"original_id": "1-0000"})
+    assert midpoint["num_event_id"] == pytest.approx((3 - 1) / (13 - 1))
     assert "Image" not in row and "_import" not in row and "unnamed_column_1" not in row
     assert all(0 <= value <= 1 for key, value in row.items() if key in FEATURES)
 
@@ -74,6 +107,13 @@ def test_system_log_normalization_is_incremental_and_agent_compatible(setup):
     assert repeated["processed"] == 0 and repeated["skipped"] == 180 and repeated["failed"] == 1
     labels = client.get("/api/v1/system-log-ml/labels").json()["counts"]
     assert labels == {"0": 60, "1": 60, "2": 60}
+
+    database.system_log_dataset_records.insert_one({"_id": "new", "Label": "0", "EventID": "100"})
+    incremental = run_status(client, "/api/v1/system-log-ml/normalization/runs",
+                             "/api/v1/system-log-ml/normalization/runs/")
+    assert incremental["processed"] == 1 and incremental["skipped"] == 180
+    assert database.system_log_dataset_normal.find_one({"_id": "new"})["num_event_id"] == 1
+    assert database.system_log_dataset_normal.find_one({"_id": "1-0000"}) == midpoint
 
     dataset = normalize_row({"_id": "dataset", "Label": "0", "EventID": "3",
                              "Channel": "Microsoft-Windows-Sysmon/Operational",
@@ -124,7 +164,9 @@ def test_training_stores_feature_weights_evaluation_and_model_artifact(setup):
 
     reloaded = SystemLogModelManager()
     assert reloaded.load(database) is True
-    assert reloaded.require().predict([raw])[0]["predicted_label"] == "2"
+    predictor = reloaded.require()
+    assert predictor.manifest["numeric_bounds"]["num_event_id"] == [1.0, 13.0]
+    assert predictor.predict([raw])[0]["predicted_label"] == "2"
 
     payload = {
         "agent_id": "host-1", "logs": [{

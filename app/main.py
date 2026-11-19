@@ -10,7 +10,7 @@ from app.services.machine_learning import ModelManager
 from app.api.standardization import router as standardization_router
 from app.api.datasets import router as datasets_router
 from app.api.system_log_datasets import router as system_log_datasets_router
-from app.api.system_log_ml import router as system_log_ml_router
+from app.api.system_log_ml import TAG as SYSTEM_LOG_ML_TAG, router as system_log_ml_router
 from app.api.normalization import router as normalization_router
 
 from fastapi import Depends, FastAPI, Request
@@ -127,7 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
                   description="SIEM هوشمند: رویدادها، هشدارها، قواعد، رخدادها، جست‌وجوی MongoDB و مدل‌های LightGBM/CatBoost. با احراز هویت و کنترل دسترسی.",
                   dependencies=[Depends(access.authorize)],
-                  openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}, {"name": "Tasks"}],
+                  openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}, {"name": "Tasks"}, SYSTEM_LOG_ML_TAG],
                   swagger_ui_parameters={"displayRequestDuration": True, "docExpansion": "none"},
                   responses={503: {"description": "MongoDB operation unavailable; batch writes may be partial"}})
     app.state.settings = config
