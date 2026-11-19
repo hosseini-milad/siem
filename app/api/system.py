@@ -64,7 +64,7 @@ def navigation(request: Request, response: Response):
 def settings(request: Request):
     return request.app.state.settings.model_dump(include={
         'mongodb_database', 'mongodb_server_selection_timeout_ms', 'mongodb_connect_timeout_ms',
-        'mongodb_socket_timeout_ms', 'datasets_root', 'ml_model_dir', 'ml_threads',
+        'mongodb_socket_timeout_ms', 'datasets_root', 'system_log_datasets_root', 'ml_model_dir', 'ml_threads',
     })
 
 

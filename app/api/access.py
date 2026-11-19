@@ -36,7 +36,7 @@ EXACT = {
 PREFIX = {
     'overview': 'overview', 'dashboard': 'overview', 'logs': 'ingestion', 'ingestion': 'ingestion',
     'search': 'events', 'explorer': 'explorer', 'detections': 'detections', 'alerts': 'alerts',
-    'incidents': 'incidents', 'datasets': 'analytics', 'normalization': 'analytics',
+    'incidents': 'incidents', 'datasets': 'analytics', 'system-log-datasets': 'analytics', 'normalization': 'analytics',
     'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'systems': 'systems',
     'users': 'users', 'device-health': 'device-health', 'tasks': 'tasks', 'task-columns': 'task-columns',
 }

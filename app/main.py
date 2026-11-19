@@ -9,6 +9,7 @@ from app.api.machine_learning import router as machine_learning_router
 from app.services.machine_learning import ModelManager
 from app.api.standardization import router as standardization_router
 from app.api.datasets import router as datasets_router
+from app.api.system_log_datasets import router as system_log_datasets_router
 from app.api.normalization import router as normalization_router
 
 from fastapi import Depends, FastAPI, Request
@@ -52,6 +53,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         'Startup marked %s previous normalization runs interrupted; use one worker and no reload',
                         interrupted.modified_count)
                 app.state.database.dataset_imports.update_many({"status": "running"}, {"$set": {"status": "interrupted"}})
+                app.state.database.system_log_dataset_imports.update_many(
+                    {"status": "running"}, {"$set": {"status": "interrupted",
+                     "finished_at": datetime.now(timezone.utc)}})
                 app.state.database.standardization_runs.update_many(
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "interruption_reason": "Server restarted; rerun standardization to rebuild blocks",
@@ -62,6 +66,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                      "interrupted_at": datetime.now(timezone.utc)}})
                 dataset = app.state.database.dataset_records
                 dataset.create_index(DATASET_ORDER)
+                app.state.database.system_log_dataset_records.create_index(
+                    [("_import.file", 1), ("_import.record_number", 1)])
+                app.state.database.system_log_dataset_imports.create_index([("created_at", -1)])
                 for columns in DATASET_IP_COLUMNS.values():
                     for column in columns:
                         dataset.create_index([(column, 1), *DATASET_ORDER],
@@ -101,6 +108,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(router)
     app.include_router(http_ingestion_router)
     app.include_router(datasets_router)
+    app.include_router(system_log_datasets_router)
     app.include_router(normalization_router)
     app.include_router(standardization_router)
     app.include_router(machine_learning_router)
