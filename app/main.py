@@ -10,6 +10,7 @@ from app.services.machine_learning import ModelManager
 from app.api.standardization import router as standardization_router
 from app.api.datasets import router as datasets_router
 from app.api.system_log_datasets import router as system_log_datasets_router
+from app.api.system_log_ml import router as system_log_ml_router
 from app.api.normalization import router as normalization_router
 
 from fastapi import Depends, FastAPI, Request
@@ -28,6 +29,7 @@ from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, 
                                           SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
+from app.services.system_log_ml import SystemLogModelManager
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -36,6 +38,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.ml = ModelManager(config.ml_model_dir, config.ml_threads)
+        app.state.system_log_ml = SystemLogModelManager()
         client = MongoClient(config.mongodb_uri, tz_aware=True, serverSelectionTimeoutMS=config.mongodb_server_selection_timeout_ms,
                              connectTimeoutMS=config.mongodb_connect_timeout_ms,
                              socketTimeoutMS=config.mongodb_socket_timeout_ms)
@@ -57,6 +60,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database.system_log_dataset_imports.update_many(
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "finished_at": datetime.now(timezone.utc)}})
+                app.state.database.system_log_normalization_runs.update_many(
+                    {"status": "running"}, {"$set": {"status": "interrupted",
+                     "finished_at": datetime.now(timezone.utc)}})
+                app.state.database.system_log_training_runs.update_many(
+                    {"status": "running"}, {"$set": {"status": "interrupted",
+                     "finished_at": datetime.now(timezone.utc)}})
                 app.state.database.standardization_runs.update_many(
                     {"status": "running"}, {"$set": {"status": "interrupted",
                      "interruption_reason": "Server restarted; rerun standardization to rebuild blocks",
@@ -70,6 +79,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database.system_log_dataset_records.create_index(
                     [("_import.file", 1), ("_import.record_number", 1)])
                 app.state.database.system_log_dataset_imports.create_index([("created_at", -1)])
+                app.state.database.system_log_dataset_normal.create_index("original_id", unique=True)
+                app.state.database.system_log_dataset_normal.create_index(
+                    [("normalization_version", 1), ("Label", 1)])
+                app.state.database.system_log_models.create_index([("created_at", -1)])
+                app.state.database.system_log_models.create_index(
+                    "active", unique=True, partialFilterExpression={"active": True})
+                app.state.database.system_log_normalization_runs.create_index([("created_at", -1)])
+                app.state.database.system_log_training_runs.create_index([("created_at", -1)])
                 for columns in DATASET_IP_COLUMNS.values():
                     for column in columns:
                         dataset.create_index([(column, 1), *DATASET_ORDER],
@@ -90,6 +107,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database[SYSTEMS].create_index([("agent_id", 1), ("last_seen", -1)])
                 app.state.database[SYSTEM_CHANGES].create_index([("system_id", 1), ("changed_at", -1)])
                 bootstrap_systems(app.state.database)
+                try:
+                    app.state.system_log_ml.load(app.state.database)
+                except Exception:
+                    logging.getLogger('uvicorn.error.siem.system_log_ml').exception(
+                        'Active system-log model could not be loaded; retrain before prediction')
                 app.state.database.siem_alerts.create_index([("status", 1), ("severity", 1), ("created_at", -1)])
                 app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
                 app.state.database.siem_rules.create_index("enabled")
@@ -115,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(http_ingestion_router)
     app.include_router(datasets_router)
     app.include_router(system_log_datasets_router)
+    app.include_router(system_log_ml_router)
     app.include_router(normalization_router)
     app.include_router(standardization_router)
     app.include_router(machine_learning_router)

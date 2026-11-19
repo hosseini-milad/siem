@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import json
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -11,12 +12,14 @@ from app.schemas.log import LogBatch, LogCreate, LogLevel, LogPage, LogRead
 from app.services import logs
 from app.services.agent_ingestion import ingest_agent_payload
 from app.services.raw_logs import parse_raw_log
+from app.services.system_log_ml import predict_and_store
 
 router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
 http_ingestion_router = APIRouter(tags=["Logs"])
 MAX_HTTP_LOG_BYTES = 2 * 1024 * 1024
 TIMESTAMP = TypeAdapter(AwareDatetime)
 LEVEL_ALIASES = {"WARN": LogLevel.WARNING, "FATAL": LogLevel.CRITICAL}
+LOGGER = logging.getLogger("uvicorn.error.siem.agent_prediction")
 
 
 class AgentReceipt(BaseModel):
@@ -119,6 +122,12 @@ async def receive_http_log(request: Request, database: DB):
         )
         if result["events"]:
             await run_in_threadpool(logs.store_logs, database, result["events"])
+        if result["records"]:
+            try:
+                await run_in_threadpool(
+                    predict_and_store, database, request.app.state.system_log_ml, result["records"])
+            except Exception:
+                LOGGER.exception("Agent logs were stored but automatic system-log prediction failed")
         return AgentReceipt(**{key: result[key] for key in ("logs", "inserted", "metrics")})
     return (await run_in_threadpool(logs.store_logs, database, [event]))[0]
 

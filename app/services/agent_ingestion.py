@@ -169,7 +169,7 @@ def store_agent_logs(database, document):
         raw = root_agent_log(document, row)
         unique[raw["_id"]] = (raw, row)
     if not unique:
-        return [], []
+        return [], [], []
     identifiers = list(unique)
     existing = {row["_id"] for row in database[AGENT_LOGS].find(
         {"_id": {"$in": identifiers}}, {"_id": 1})}
@@ -177,7 +177,8 @@ def store_agent_logs(database, document):
         ReplaceOne({"_id": raw["_id"]}, raw, upsert=True) for raw, _ in unique.values()
     ])
     inserted_rows = [row for identifier, (_, row) in unique.items() if identifier not in existing]
-    return list(unique.values()), inserted_rows
+    inserted_documents = [raw for identifier, (raw, _) in unique.items() if identifier not in existing]
+    return list(unique.values()), inserted_rows, inserted_documents
 
 
 def store_metrics(database, document, system):
@@ -232,10 +233,10 @@ def ingest_agent_payload(database, payload, source_ip, source_port, received_at)
         document["mac"] = system["mac"]
         document["system_id"] = system["_id"]
     has_metrics = store_metrics(database, document, system)
-    stored, inserted_rows = store_agent_logs(database, document)
+    stored, inserted_rows, inserted_documents = store_agent_logs(database, document)
     return {
         "events": windows_events(document, inserted_rows), "logs": len(stored),
-        "inserted": len(inserted_rows), "metrics": has_metrics,
+        "inserted": len(inserted_rows), "metrics": has_metrics, "records": inserted_documents,
     }
 
 
