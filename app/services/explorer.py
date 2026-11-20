@@ -5,6 +5,8 @@ import math
 import re
 
 from app.models.log import COLLECTION
+from app.services.agent_ingestion import AGENT_LOGS
+from app.services.system_log_ml import AGENT_LOG_LABELS
 
 TIMEOUT_MS = 30_000
 MAX_CANDIDATES = 1_000
@@ -196,3 +198,25 @@ def public_record(row):
         risk = {'score': score, 'severity': severity}
     return {**output, 'id': str(row['_id']), 'normalized': next(iter(row.get('normalized', [])), None),
             'standardized': next(iter(row.get('standardized', [])), None), 'risk': risk}
+
+
+def list_system_records(database, start, end, query, label, limit, offset):
+    filters = {}
+    dates = {op: value for op, value in (('$gte', start), ('$lt', end)) if value is not None}
+    if dates:
+        filters['timestamp'] = dates
+    if query:
+        filters['$or'] = [{'_id': query}, {'agent_id': query}]
+    if label is not None:
+        filters['predicted_label'] = label
+    collection = database[AGENT_LOG_LABELS]
+    total = collection.count_documents(filters, maxTimeMS=TIMEOUT_MS)
+    with collection.find(filters).sort(LOG_ORDER).skip(offset).limit(limit).max_time_ms(TIMEOUT_MS) as cursor:
+        items = list(cursor)
+    raw = {row['_id']: row for row in database[AGENT_LOGS].find(
+        {'_id': {'$in': [row['_id'] for row in items]}}).max_time_ms(TIMEOUT_MS)}
+    for row in items:
+        row['id'] = row.pop('_id')
+        row['raw'] = raw.get(row['id'])
+        row['event_id'] = (row['raw'] or {}).get('event_id')
+    return {'items': items, 'total': total, 'limit': limit, 'offset': offset}

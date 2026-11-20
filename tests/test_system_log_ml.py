@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -198,3 +199,25 @@ def test_training_stores_feature_weights_evaluation_and_model_artifact(setup):
     assert repeated.status_code == 201 and repeated.json()["inserted"] == 0
     assert database.agent_logs_label.count_documents({}) == 1
     assert database.agent_logs_label.find_one({"_id": scored["_id"]})["predicted_label"] == "2"
+
+
+def test_explorer_lists_labeled_system_logs_with_raw_details(setup):
+    client, database = setup
+
+    timestamp = datetime(2026, 11, 20, 12, tzinfo=timezone.utc)
+    database.agent_logs.insert_one({"_id": "log-1", "event_id": 13})
+    database.agent_logs_label.insert_many([
+        {"_id": "log-1", "agent_id": "host-1", "timestamp": timestamp,
+         "predicted_label": "2", "features": {"num_event_id": 1}},
+        {"_id": "log-2", "agent_id": "host-2", "timestamp": timestamp,
+         "predicted_label": "0"},
+    ])
+    path = "/api/v1/explorer/system-records"
+    first = client.get(path, params={"limit": 1}).json()
+    assert first["total"] == 2 and first["items"][0]["id"] == "log-2"
+    second = client.get(path, params={"limit": 1, "offset": 1}).json()
+    assert second["items"][0]["raw"] == {"_id": "log-1", "event_id": 13}
+    filtered = client.get(path, params={"q": "host-1", "label": "2",
+                                       "start": timestamp.isoformat()}).json()
+    assert filtered["total"] == 1 and filtered["items"][0]["features"] == {"num_event_id": 1}
+    assert client.get(path, params={"end": timestamp.isoformat()}).json()["total"] == 0

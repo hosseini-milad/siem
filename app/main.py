@@ -29,7 +29,7 @@ from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, 
                                           SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
-from app.services.system_log_ml import SystemLogModelManager
+from app.services.system_log_ml import AGENT_LOG_LABELS, SystemLogModelManager
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -99,6 +99,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database[PAYLOADS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database[PAYLOADS].create_index([("agent_id", 1), ("timestamp", -1)])
                 app.state.database[AGENT_LOGS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
+                labeled_logs = app.state.database[AGENT_LOG_LABELS]
+                labeled_logs.create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
+                labeled_logs.create_index(LOG_ORDER)
+                labeled_logs.create_index([("agent_id", 1), *LOG_ORDER])
+                labeled_logs.create_index([("predicted_label", 1), *LOG_ORDER])
                 app.state.database[AGENT_LOGS].create_index([("system_id", 1), ("timestamp", -1)])
                 app.state.database[AGENT_LOGS].create_index([("event_id", 1), ("timestamp", -1)])
                 app.state.database[SYSTEM_METRICS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)

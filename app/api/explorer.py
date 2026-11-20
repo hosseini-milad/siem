@@ -7,7 +7,7 @@ from pymongo.errors import ExecutionTimeout, PyMongoError
 
 from app.db.session import DB
 from app.schemas.log import LogLevel
-from app.services.explorer import list_records
+from app.services.explorer import list_records, list_system_records
 
 logger = logging.getLogger('uvicorn.error.siem.explorer')
 router = APIRouter(prefix='/api/v1/explorer', tags=['Search'])
@@ -42,3 +42,17 @@ def records(database: DB, filters: Annotated[ExplorerFilters, Query()]):
         logger.error('MongoDB explorer query failed (kind=%s, error=%s, code=%s)',
                      filters.kind, type(exc).__name__, getattr(exc, 'code', None))
         raise
+
+
+@router.get('/system-records', summary='کاوش لاگ‌های سیستم برچسب‌خورده')
+def system_records(
+    database: DB, start: AwareDatetime | None = None, end: AwareDatetime | None = None,
+    q: str = Query('', max_length=255), label: str | None = Query(None, max_length=64),
+    limit: int = Query(15, ge=1, le=100), offset: int = Query(0, ge=0),
+):
+    if start and end and start >= end:
+        raise HTTPException(422, 'start must be earlier than end')
+    try:
+        return list_system_records(database, start, end, q.strip(), label, limit, offset)
+    except ExecutionTimeout as exc:
+        raise HTTPException(503, 'Explorer query timed out. Try a smaller date range.') from exc

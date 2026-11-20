@@ -30,6 +30,7 @@ EXACT = {
     '/dashboard': 'overview',
     '/logs': 'ingestion',
     '/api/v1/ml/model': 'current-model',
+    '/api/v1/system-log-ml/models/current': 'current-model',
     '/api/v1/ml/predict': 'current-model',
     '/api/v1/ml/predict-matrix': 'current-model',
 }
@@ -81,6 +82,8 @@ def authorize(request: Request):
     if path in SESSION_ONLY:
         return
     section = EXACT.get(path) or PREFIX.get(path.removeprefix('/api/v1/').split('/')[0])
+    if path == '/api/v1/system-log-ml/models/current' and allowed(user, 'analytics', write):
+        return
     if section == 'tasks':
         return
     if not section or not allowed(user, section, write):
