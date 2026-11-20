@@ -49,11 +49,15 @@ def navigation(request: Request, response: Response):
                             ('device-health', 'system'), ('users', 'system')):
             index = next(i for i, menu in enumerate(menus) if menu['id'] == parent)
             menus.insert(index + 1, {'id': key, 'label': SECTIONS[key], 'parent': parent, 'tags': []})
+        if allowed(user, 'alerts'):
+            index = next(i for i, menu in enumerate(menus) if menu['id'] == 'alerts')
+            menus.insert(index + 1, {'id': 'alert-thresholds', 'label': 'تنظیم آستانه‌ها',
+                                     'parent': 'alerts', 'tags': []})
         menus.extend([
             {'id': 'tasks', 'label': SECTIONS['tasks'], 'tags': ['Tasks']},
             {'id': 'task-columns', 'label': SECTIONS['task-columns'], 'parent': 'tasks', 'tags': []},
         ])
-        menus = [menu for menu in menus if (menu['id'] == 'tasks' or allowed(user, menu['id'])) and
+        menus = [menu for menu in menus if (menu['id'] in {'tasks', 'alert-thresholds'} or allowed(user, menu['id'])) and
                  (menu['id'] not in {'users', 'task-columns'} or user['role'] != 'client')]
     return {
         'authentication': request.app.state.settings.auth_required,

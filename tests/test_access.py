@@ -63,7 +63,10 @@ def test_roles_grants_and_session_revocation(application):
     assert admin.post('/api/v1/alerts/from-predictions').status_code == 403
     assert admin.get('/api/v1/logs').status_code == 403
     assert admin.get('/api/v1/explorer/records').status_code == 403
-    assert {row['id'] for row in admin.get('/api/v1/system/navigation').json()['menus']} == {'users', 'systems', 'alerts', 'tasks'}
+    assert {row['id'] for row in admin.get('/api/v1/system/navigation').json()['menus']} == {'users', 'systems', 'alerts', 'alert-thresholds', 'tasks'}
+    thresholds = admin.get('/api/v1/alerts/settings/web')
+    assert thresholds.status_code == 200
+    assert admin.put('/api/v1/alerts/settings/web', json=thresholds.json()).status_code == 403
     payload = {'username': 'endpoint', 'name': 'Endpoint', 'password': PASSWORD, 'device_id': 'soc'}
     assert admin.post('/api/v1/users', json={**payload, 'permissions': {'system': 'write'}}).status_code == 403
     assert admin.post('/api/v1/users', json={**payload, 'device_id': None}).status_code == 422

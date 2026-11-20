@@ -29,6 +29,7 @@ from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, 
                                           SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
+from app.services.web_alerts import COOLDOWNS
 from app.services.web_access import WebAccessLog, access_log_handler, local_web_collector
 from app.services.system_log_ml import AGENT_LOG_LABELS, SystemLogModelManager
 
@@ -58,6 +59,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 web_records.create_index([('service', 1), *LOG_ORDER])
                 web_records.create_index([('status', 1), *LOG_ORDER])
                 web_records.create_index([('source_ip', 1), *LOG_ORDER])
+                web_records.create_index([('service', 1), ('security_event', 1), ('status', 1), ('timestamp', -1)])
+                web_records.create_index([('service', 1), ('status', 1), ('timestamp', -1)])
+                app.state.database[COOLDOWNS].create_index('last_triggered_at', expireAfterSeconds=web_services.RETENTION)
                 if config.auth_required:
                     initialize_access(app.state.database)
                 interrupted = app.state.database.normalization_runs.update_many(

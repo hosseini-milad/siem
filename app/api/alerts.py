@@ -4,11 +4,11 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query
 
 from app.db.session import DB
-from app.schemas.siem import AlertCreate, AlertStatus, AlertUpdate, PredictionAlerts, Severity, SystemAlertCreate
+from app.schemas.siem import AlertCreate, AlertStatus, AlertUpdate, PredictionAlerts, Severity, SystemAlertCreate, WebAlertSettings
 from app.services import alerts as service
-from app.services import siem
+from app.services import siem, web_alerts
 
-AlertDomain = Literal['network', 'system']
+AlertDomain = Literal['network', 'system', 'web']
 
 router = APIRouter(prefix='/api/v1')
 
@@ -45,6 +45,20 @@ def system_alert(body: SystemAlertCreate, database: DB):
 @router.post('/alerts/from-predictions', tags=['Alerts'], summary='تبدیل پیش‌بینی‌های ذخیره‌شدهٔ ML به هشدار بدون تکرار')
 def prediction_alerts(body: PredictionAlerts, database: DB):
     return service.alerts_from_predictions(database, body.min_probability, body.limit)
+
+
+@router.get('/alerts/settings/web', tags=['Alerts'], response_model=WebAlertSettings,
+            summary='خواندن آستانه‌های هشدار وب‌سرویس')
+def web_settings(database: DB):
+    return web_alerts.settings(database)
+
+
+@router.put('/alerts/settings/web', tags=['Alerts'], response_model=WebAlertSettings,
+            summary='ذخیرهٔ آستانه‌های هشدار وب‌سرویس')
+def update_web_settings(body: WebAlertSettings, database: DB):
+    values = body.model_dump()
+    database[web_alerts.SETTINGS].update_one({'_id': 'default'}, {'$set': values}, upsert=True)
+    return values
 
 
 @router.get('/alerts/{alert_id}', tags=['Alerts'])

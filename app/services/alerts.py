@@ -4,6 +4,7 @@ from uuid import NAMESPACE_URL, uuid5
 from app.services import siem
 from app.services.agent_ingestion import AGENT_LOGS
 from app.services.system_log_ml import AGENT_LOG_LABELS
+from app.services.web_access import RECORDS
 
 
 def emit_alert(db, identity, body):
@@ -27,10 +28,10 @@ def alerts_from_predictions(db, minimum, limit):
 
 
 def domain_filter(domain):
-    if domain == 'system':
-        return {'domain': 'system'}
+    if domain in ('system', 'web'):
+        return {'domain': domain}
     if domain == 'network':
-        return {'domain': {'$ne': 'system'}}
+        return {'domain': {'$nin': ['system', 'web']}}
     return {}
 
 
@@ -98,4 +99,9 @@ def alert_evidence(db, alert):
         for collection in (AGENT_LOG_LABELS, AGENT_LOGS):
             row = db[collection].find_one({'_id': identity})
             references.append({'collection': collection, 'id': identity, 'record': siem.public(row)})
+    if alert.get('kind') == 'web_threshold':
+        ids = evidence.get('web_record_ids', [])
+        rows = {row['_id']: row for row in db[RECORDS].find({'_id': {'$in': ids}})}
+        references.extend({'collection': RECORDS, 'id': identity, 'record': siem.public(rows.get(identity))}
+                          for identity in ids)
     return references

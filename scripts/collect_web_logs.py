@@ -61,6 +61,8 @@ def sanitize(line):
             pass
     if isinstance(row.get('security_event'), str) and row['security_event'] in SECURITY_EVENTS:
         event['security_event'] = row['security_event']
+    if isinstance(subject := row.get('auth_subject'), str) and re.fullmatch(r'[a-f0-9]{64}', subject):
+        event['auth_subject'] = subject
     if row.get('url_scheme') in ('http', 'https'):
         event['url_scheme'] = row['url_scheme']
     if isinstance(row.get('url_host'), str) and re.fullmatch(r'[A-Za-z0-9.:\[\]-]{1,253}', row['url_host']):

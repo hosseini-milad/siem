@@ -1,3 +1,4 @@
+import hmac
 import re
 import secrets
 from io import BytesIO
@@ -194,6 +195,11 @@ def count_login_attempt(database, key, limit):
 def login(body: Login, request: Request, response: Response, database: DB):
     address = request.client.host if request.client else 'unknown'
     username = body.username.lower()
+    collector_key = request.app.state.settings.web_collector_keys.get('siem-api')
+    if request.app.state.settings.web_access_log_path and collector_key is not None:
+        request.state.web_auth_subject = hmac.digest(
+            collector_key.get_secret_value().encode(), ('web-auth-subject\0' + username).encode(), 'sha256',
+        ).hex()
     count_login_attempt(database, f'ip:{address}', 30)
     count_login_attempt(database, f'user:{username}:{address}', 8)
     user = database.users.find_one({'username': username})

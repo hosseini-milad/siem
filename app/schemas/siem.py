@@ -31,6 +31,19 @@ class SystemAlertCreate(StrictBody):
     severity: Severity = 'medium'
 
 
+class WebAlertRule(StrictBody):
+    enabled: bool
+    threshold: int = Field(ge=1, le=500)
+    window_minutes: int = Field(ge=1, le=60)
+    cooldown_minutes: int = Field(ge=1, le=1440)
+    severity: Severity
+
+
+class WebAlertSettings(StrictBody):
+    login_failure: WebAlertRule
+    server_error: WebAlertRule
+
+
 class AlertUpdate(StrictBody):
     status: AlertStatus
 

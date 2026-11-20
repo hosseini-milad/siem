@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 import hmac
 import json
 import sqlite3
@@ -41,6 +42,7 @@ def test_web_access_collection_and_signed_replay(tmp_path):
             assert denied.status_code == 401
             login = json.loads(path.read_text().splitlines()[-1])
             assert login['security_event'] == 'login_failure'
+            assert len(login['auth_subject']) == 64 and 'private-user' not in path.read_text()
             assert login['request_headers']['content_type'] == 'application/json'
             assert login['response_body_fields'] == ['detail']
             assert 'private-password' not in path.read_text()
@@ -104,5 +106,79 @@ def test_web_access_collection_and_signed_replay(tmp_path):
             assert client.post(url, content=heartbeat, headers=headers).status_code == 202
             assert json.loads(heartbeat)['status_codes'] == {}
             assert records.count_documents({}) == 2
+        finally:
+            db.client.drop_database(config.mongodb_database)
+
+
+def test_configurable_web_thresholds_count_distinct_failures_and_link_evidence(tmp_path):
+    service = 'test-web'
+    key = 'dedicated-collector-key-for-testing'
+    config = Settings(mongodb_database='siem_test_' + uuid4().hex, ml_model_dir=str(tmp_path),
+                      web_collector_keys={service: key})
+    with TestClient(create_app(config)) as client:
+        db = client.app.state.database
+        try:
+            settings_path = '/api/v1/alerts/settings/web'
+            rule_settings = client.get(settings_path).json()
+            assert rule_settings['login_failure']['threshold'] == 5
+            assert rule_settings['server_error']['threshold'] == 10
+            rule_settings['server_error']['threshold'] = 2
+            assert client.put(settings_path, json=rule_settings).json() == rule_settings
+
+            now = datetime.now(timezone.utc)
+            window_end = now.replace(second=0, microsecond=0)
+            subject = 'a' * 64
+
+            def request_record(status, number, *, login=False, age=0):
+                return {'timestamp': (now - timedelta(minutes=age)).isoformat(),
+                        'request_id': f'test-{number}', 'method': 'POST', 'route': '/login',
+                        'status': status, 'duration_ms': 1, 'request_bytes': 10, 'response_bytes': 10,
+                        'source_ip': f'192.0.2.{number % 200 + 1}',
+                        **({'security_event': 'login_failure', 'auth_subject': subject} if login else {})}
+
+            def signed(events):
+                codes = Counter(str(row['status']) for row in events)
+                classes = Counter(str(row['status'])[0] + 'xx' for row in events)
+                batch = {'batch_id': str(uuid4()), 'service': service,
+                         'interval_start': (window_end - timedelta(minutes=1)).isoformat(),
+                         'interval_end': window_end.isoformat(), 'events': events, 'status_codes': codes,
+                         'status_classes': classes, 'latency_buckets': [len(events), *([0] * 10)],
+                         'omitted_details': 0, 'invalid_lines': 0}
+                payload = json.dumps(batch).encode()
+                headers = {'X-SIEM-Service': service,
+                           'X-SIEM-Signature': hmac.digest(key.encode(), payload, 'sha256').hex()}
+                return payload, headers
+
+            def send(events):
+                content, headers = signed(events)
+                response = client.post('/api/v1/web-services/batches', content=content, headers=headers)
+                assert response.status_code == 202, response.text
+                return content, headers
+
+            send([request_record(401, index, login=True) for index in range(4)] + [
+                request_record(401, 0, login=True), request_record(429, 5, login=True),
+                request_record(401, 6), request_record(401, 7, login=True, age=10),
+            ])
+            assert db.siem_alerts.count_documents({}) == 0
+            content, headers = send([request_record(401, 8, login=True)])
+            assert client.post('/api/v1/web-services/batches', content=content, headers=headers).json()['duplicate']
+            send([request_record(401, 9, login=True)])
+            send([request_record(503, 10), request_record(500, 11)])
+            web = client.get('/api/v1/alerts', params={'domain': 'web'}).json()['items']
+            assert len(web) == 2
+            by_rule = {row['evidence']['rule']: row for row in web}
+            login = by_rule['login_failure']
+            assert login['evidence']['observed_count'] == 5
+            assert login['evidence']['auth_subject'] == subject
+            sources = client.get(f"/api/v1/alerts/{login['id']}/evidence").json()['items']
+            assert sources and all(row['collection'] == 'web-records' and row['record']['status'] == 401 for row in sources)
+            assert by_rule['server_error']['evidence']['observed_count'] == 2
+            assert client.get('/api/v1/alerts', params={'domain': 'network'}).json()['total'] == 0
+            assert client.get('/api/v1/alerts/summary', params={'domain': 'web'}).json()['total'] == 2
+            rule_settings['server_error']['enabled'] = False
+            assert client.put(settings_path, json=rule_settings).status_code == 200
+            db.web_alert_cooldowns.delete_many({})
+            send([request_record(503, 12)])
+            assert db.siem_alerts.count_documents({'evidence.rule': 'server_error'}) == 1
         finally:
             db.client.drop_database(config.mongodb_database)

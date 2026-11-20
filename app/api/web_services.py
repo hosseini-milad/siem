@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.db.session import DB
 from app.services.web_access import INGEST_PATH, RECORDS
+from app.services.web_alerts import inspect_batch
 
 router = APIRouter(tags=['System'])
 COLLECTION = 'web_service_batches'
@@ -52,6 +53,7 @@ class RequestEvent(BaseModel):
     response_headers: HeaderMetadata | None = None
     request_body_fields: list[BodyField] = Field(default_factory=list, max_length=11)
     response_body_fields: list[BodyField] = Field(default_factory=list, max_length=11)
+    auth_subject: str | None = Field(None, pattern=r'^[a-f0-9]{64}$')
     security_event: Literal['login_success', 'login_failure', 'access_denied', 'permission_changed'] | None = None
 
 
@@ -94,6 +96,7 @@ def store_batch(database, batch, digest, received):
             operations.append(UpdateOne(
                 {'_id': f'{identity}:{position}'}, {'$setOnInsert': row}, upsert=True))
         database[RECORDS].bulk_write(operations, ordered=False)
+        inspect_batch(database, batch.service, batch.events, datetime.now(timezone.utc))
     return {'batch_id': batch.batch_id, 'duplicate': duplicate}
 
 

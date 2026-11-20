@@ -136,6 +136,8 @@ class WebAccessLog:
                 security_event = 'access_denied'
             if security_event:
                 row['security_event'] = security_event
+            if subject := scope.get('state', {}).get('web_auth_subject'):
+                row['auth_subject'] = subject
             if scope.get('client'):
                 row['source_ip'] = scope['client'][0]
             try:
