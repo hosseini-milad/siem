@@ -25,6 +25,7 @@ from app.api.logs import http_ingestion_router, router
 from app.core.config import Settings
 from app.models.log import COLLECTION, RETENTION_SECONDS
 from app.services.access import initialize_access
+from app.services.alert_tasks import monitor_alert_tasks
 from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, SYSTEMS,
                                           SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
@@ -149,10 +150,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database.siem_alerts.create_index([("status", 1), ("severity", 1), ("created_at", -1)])
                 app.state.database.siem_alerts.create_index([("created_at", -1), ("_id", -1)])
                 app.state.database.siem_alerts.create_index([("domain", 1), ("created_at", -1), ("_id", -1)])
+                app.state.database.siem_alerts.create_index('task_pending', partialFilterExpression={'task_pending': True})
+                app.state.database.tasks.create_index('alert.domain', partialFilterExpression={'routing_pending': True})
                 app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
                 app.state.database.siem_rules.create_index("enabled")
             await run_in_threadpool(initialize)
             async with (local_web_collector(config),
+                        monitor_alert_tasks(app.state.database),
                         monitor_collectors(app.state.database, tuple(config.web_collector_keys))):
                 if config.raw_log_port:
                     async with listen_for_raw_logs(app.state.database, config.raw_log_host, config.raw_log_port):

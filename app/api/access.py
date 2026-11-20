@@ -16,6 +16,7 @@ from pymongo.errors import DuplicateKeyError
 
 from app.db.session import DB
 from app.services.web_access import INGEST_PATH
+from app.services.alert_tasks import BRANCHES, branch_values, task_id
 from app.services.access import (COOKIE, SECTIONS, SESSION_SECONDS, allowed, now,
                                  password_hash, password_matches, public_user, token_digest)
 
@@ -49,12 +50,14 @@ PREFIX = {
 def get_user(request: Request):
     token = request.cookies.get(COOKIE, '')
     if not 1 <= len(token) <= 64:
+        request.state.web_security_event = 'login_failure'
         raise HTTPException(401, 'وارد حساب کاربری شوید.')
     database = request.app.state.database
     session = database.sessions.find_one({'_id': token_digest(token), 'expires_at': {'$gt': now()}})
     user = session and database.users.find_one({'_id': session['user_id'], 'active': True,
                                                'session_version': session['session_version']}, {'avatar_data': 0})
     if not user:
+        request.state.web_security_event = 'login_failure'
         raise HTTPException(401, 'نشست معتبر نیست. دوباره وارد شوید.')
     return user
 
@@ -86,10 +89,18 @@ def authorize(request: Request):
     section = EXACT.get(path) or PREFIX.get(path.removeprefix('/api/v1/').split('/')[0])
     if path == '/api/v1/system-log-ml/models/current' and allowed(user, 'analytics', write):
         return
-    if section == 'tasks':
+    if section == 'tasks' or (section and allowed(user, section, write)):
         return
-    if not section or not allowed(user, section, write):
-        raise HTTPException(403, 'دسترسی به این بخش یا عملیات مجاز نیست.')
+    if (not write and user['role'] == 'admin'
+            and path in {'/api/v1/alerts/{alert_id}', '/api/v1/alerts/{alert_id}/evidence'}):
+        alert_id = request.path_params['alert_id']
+        if isinstance(alert_id, str) and re.fullmatch(r'[a-f0-9-]{36}', alert_id, re.I):
+            if request.app.state.database.tasks.find_one({
+                '_id': task_id(alert_id.lower()), 'alert.id': alert_id.lower(),
+                '$or': [{'board': user['_id']}, {'board': 'central', 'assignees': user['_id']}],
+            }, {'_id': 1}):
+                return
+    raise HTTPException(403, 'دسترسی به این بخش یا عملیات مجاز نیست.')
 
 
 def current_user(request: Request):
@@ -154,7 +165,7 @@ class NewUser(BaseModel):
     password: Password
     device_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9_-]{1,100}$')
     permissions: Grants | None = None
-    branch: Name | None = None
+    branch: Text | None = None
     system: SystemProfile | None = None
     system_id: str | None = None
 
@@ -168,7 +179,7 @@ class UserUpdate(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     name: Name | None = None
     username: Username | None = None
-    branch: Name | None = None
+    branch: Text | None = None
     system: EditableSystemProfile | None = None
     active: bool | None = None
     permissions: Grants | None = None
@@ -293,13 +304,8 @@ def latest_metrics(database, system_ids):
 
 
 @router.patch('/auth/branch')
-def update_branch(body: BranchUpdate, user: User, database: DB):
-    if user['role'] != 'admin':
-        raise HTTPException(403, 'فقط ادمین می‌تواند نام شاخهٔ خودش را تنظیم کند.')
-    updated = database.users.find_one_and_update({'_id': user['_id'], 'role': 'admin'},
-                                                 {'$set': {'branch': body.branch}},
-                                                 return_document=ReturnDocument.AFTER)
-    return public_user(updated)
+def update_branch(body: BranchUpdate, user: User):
+    raise HTTPException(403, 'مدیریت کل شاخه را در مدیریت کاربران تعیین می‌کند.')
 
 
 def with_branches(database, rows):
@@ -467,6 +473,13 @@ def users(user: User, database: DB, response: Response,
     return account_page(database, scope, limit, offset)
 
 
+@router.get('/users/branches')
+def user_branches(user: User):
+    if user['role'] != 'manager':
+        raise HTTPException(403, 'مدیریت شاخه‌ها در اختیار مدیریت کل است.')
+    return {'items': [{'id': domain, 'name': name} for domain, name in BRANCHES.items()]}
+
+
 @router.post('/users', status_code=201)
 def create_user(body: NewUser, user: User, database: DB):
     account_scope(user)
@@ -491,12 +504,14 @@ def create_user(body: NewUser, user: User, database: DB):
            'system_id': None if manager else body.system_id,
            'active': True, 'session_version': 0, 'created_by': user['_id']}
     if manager:
-        doc['branch'] = body.branch or ''
+        doc.update(branch_values(body.branch or ''))
     elif body.system is not None:
         doc['system'] = body.system.model_dump()
     try:
         database.users.insert_one(doc)
     except DuplicateKeyError as exc:
+        if 'alert_domain' in (exc.details or {}).get('keyPattern', {}):
+            raise HTTPException(409, 'این شاخهٔ هشدار از قبل ادمین فعال دارد.') from exc
         raise HTTPException(409, 'نام کاربری یا سیستم انتخاب‌شده قبلاً ثبت شده است.') from exc
     return public_user(doc)
 
@@ -511,6 +526,8 @@ def update_user(user_id: str, body: UserUpdate, user: User, database: DB, reques
     changes = body.model_dump(exclude_none=True, exclude={'system_id'})
     if body.username is not None:
         changes['username'] = body.username.lower()
+    if body.branch is not None:
+        changes.update(branch_values(body.branch))
     requires_admin = body.branch is not None or (body.permissions is not None and (
         bool({'users', 'task-columns'} & body.permissions.keys()) or body.permissions.get('device-health') == 'write'))
     if requires_admin and (user['role'] != 'manager' or body.system is not None):
@@ -538,6 +555,8 @@ def update_user(user_id: str, body: UserUpdate, user: User, database: DB, reques
         updated = database.users.find_one_and_update({'_id': user_id, **scope}, update,
                                                      return_document=ReturnDocument.AFTER)
     except DuplicateKeyError as exc:
+        if 'alert_domain' in (exc.details or {}).get('keyPattern', {}):
+            raise HTTPException(409, 'این شاخهٔ هشدار از قبل ادمین فعال دارد.') from exc
         raise HTTPException(409, 'نام کاربری قبلاً ثبت شده است.') from exc
     if not updated:
         raise HTTPException(404, 'کاربر سازگار با این عملیات پیدا نشد.')

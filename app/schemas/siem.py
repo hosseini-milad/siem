@@ -21,6 +21,7 @@ class AlertCreate(StrictBody):
     description: Description
     severity: Severity = 'medium'
     source: Name = 'manual'
+    domain: Literal['network', 'system', 'web'] | None = None
     event_ids: list[UUID] = Field(default_factory=list, max_length=100)
 
 

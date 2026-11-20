@@ -69,6 +69,9 @@ def initialize_access(database):
     database.users.create_index('device_id', unique=True, partialFilterExpression={'device_id': {'$type': 'string'}})
     database.users.create_index('system_id', unique=True, partialFilterExpression={'system_id': {'$type': 'string'}})
     database.users.create_index([('role', 1), ('created_by', 1), ('username', 1)])
+    database.users.create_index('alert_domain', unique=True, partialFilterExpression={
+        'role': 'admin', 'active': True, 'alert_domain': {'$type': 'string'},
+    })
     database.tasks.create_index([('board', 1), ('created_at', -1), ('_id', 1)])
     database.tasks.create_index([('column_id', 1), ('created_at', -1), ('_id', 1)])
     database.tasks.create_index([('assignees', 1), ('closed_at', 1)])

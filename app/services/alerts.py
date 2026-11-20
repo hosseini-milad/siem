@@ -1,7 +1,9 @@
 from datetime import timedelta
 from uuid import NAMESPACE_URL, uuid5
 
-from app.services import siem
+from pymongo.errors import PyMongoError
+
+from app.services import alert_tasks, siem
 from app.services.agent_ingestion import AGENT_LOGS
 from app.services.system_log_ml import AGENT_LOG_LABELS
 from app.services.owasp_signals import BATCHES, COLLECTION as WEB_SIGNALS
@@ -10,8 +12,15 @@ from app.services.web_access import RECORDS
 
 def emit_alert(db, identity, body):
     stamp = siem.now()
-    return db.siem_alerts.update_one({'_id': identity}, {'$setOnInsert': {
-        **body, 'status': 'open', 'created_at': stamp, 'updated_at': stamp}}, upsert=True).upserted_id is not None
+    result = db.siem_alerts.update_one({'_id': identity}, {'$setOnInsert': {
+        **body, 'status': 'open', 'created_at': stamp, 'updated_at': stamp,
+        'task_pending': True}}, upsert=True)
+    try:
+        if alert := db.siem_alerts.find_one({'_id': identity, 'task_pending': True}):
+            alert_tasks.deliver(db, alert)
+    except PyMongoError:
+        alert_tasks.LOGGER.exception('Could not deliver task for alert %s', identity)
+    return result.upserted_id is not None
 
 
 def alerts_from_predictions(db, minimum, limit):
@@ -74,6 +83,7 @@ def alert_from_system_log(db, body):
         'evidence': {
             'agent_log_id': body.log_id, 'predicted_label': log['predicted_label'],
             'prediction_confidence': log['prediction_confidence'], 'model_id': log['model_id'],
+            'occurred_at': log.get('timestamp'),
         },
     })
     return siem.public(db.siem_alerts.find_one({'_id': identity}))

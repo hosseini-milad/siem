@@ -168,13 +168,18 @@ def task_view(task, user, names, include_comments=False):
     item.update(
         id=task['_id'], description=task['description'], tags=task.get('tags') or [],
         updated_by=editor_name(task, user, names),
-        creator=person_name(names, task['creator']),
+        creator=person_name(names, task['creator']) if task['creator'] else 'سامانهٔ SIEM',
         assignees=[{'id': key, 'name': person_name(names, key), 'avatar_url': avatar_url(names.get(key, {}))} for key in assignees],
         comment_count=task['comment_count'],
         can_comment=supervisor or participates or allowed(user, 'tasks', write=True),
         can_move=can_move,
         can_assign=can_move and task['board'] == own_board(user),
     )
+    if task.get('alert'):
+        assigned_admin = user['role'] == 'admin' and (task['board'] == identity or (
+            task['board'] == CENTRAL and identity in task['assignees']))
+        item.update(alert=task['alert'], routing_pending=task.get('routing_pending', False),
+                    can_view_alert=allowed(user, 'alerts') or assigned_admin)
     if include_comments:
         item['comments'] = [{**comment, 'author': (
             'ادمین' if restricted and comment['author'] not in {identity, task['creator']}
@@ -184,6 +189,8 @@ def task_view(task, user, names, include_comments=False):
 
 def editor_name(task, user, names):
     editor = task.get('updated_by', task['creator'])
+    if editor is None:
+        return 'سامانهٔ SIEM'
     if task['board'] == CENTRAL and user['role'] != 'manager' and editor not in {user['_id'], task['creator']}:
         return 'ادمین'
     return person_name(names, editor)
@@ -199,7 +206,7 @@ def task_names(database, tasks):
         ids.update([task['creator'], task.get('updated_by', task['creator'])])
         ids.update(task['assignees'])
         ids.update(comment['author'] for comment in task.get('comments', ()))
-    return {row['_id']: row for row in database.users.find({'_id': {'$in': list(ids)}}, {'name': 1, 'avatar_token': 1})}
+    return {row['_id']: row for row in database.users.find({'_id': {'$in': list(ids - {None})}}, {'name': 1, 'avatar_token': 1})}
 
 
 @router.get('/tasks/boards')
@@ -309,6 +316,8 @@ def update_task(task_id: Identifier, body: TaskUpdate, user: User, database: DB)
             raise HTTPException(422, 'ستون مقصد در این تابلو وجود ندارد.')
         if body.column_id == DONE:
             changes['closed_at'] = now()
+    if task.get('routing_pending') and (body.assignees is not None or body.column_id not in (None, 'todo')):
+        changes['routing_pending'] = False
     changes['updated_by'] = user['_id']
     updated = database.tasks.find_one_and_update(
         {'_id': task_id, 'revision': body.revision, 'closed_at': None, **scope},

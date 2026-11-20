@@ -17,7 +17,10 @@ def evaluate_rules(db):
         if rule.get('level'):
             query['level'] = rule['level']
         groups = db.log_events.aggregate([
-            {'$match': query}, {'$group': {'_id': '$source', 'count': {'$sum': 1}}},
+            {'$match': query}, {'$group': {'_id': '$source', 'count': {'$sum': 1},
+                                         'occurred_at': {'$max': '$timestamp'},
+                                         'event_ids': {'$topN': {'n': 20, 'sortBy': {'timestamp': -1, '_id': -1},
+                                                                 'output': '$_id'}}}},
             {'$match': {'count': {'$gte': rule['threshold']}}}, {'$sort': {'_id': 1}}, {'$limit': 1000}],
             maxTimeMS=30000)
         matches = created = 0
@@ -27,9 +30,10 @@ def evaluate_rules(db):
             identity = str(uuid5(NAMESPACE_URL, f"siem-rule:{rule['_id']}:{group['_id']}:{bucket}"))
             created += emit_alert(db, identity, {
                 'title': rule['name'], 'description': rule['description'], 'severity': rule['severity'],
-                'source': group['_id'], 'rule_id': rule['_id'], 'kind': 'threshold', 'event_ids': [],
+                'source': group['_id'], 'rule_id': rule['_id'], 'kind': 'threshold', 'event_ids': group['event_ids'],
                 'evidence': {'count': group['count'], 'threshold': rule['threshold'],
-                             'window_start': cutoff, 'window_end': stamp, 'level': rule.get('level')}})
+                             'window_start': cutoff, 'window_end': stamp, 'level': rule.get('level'),
+                             'occurred_at': group['occurred_at']}})
         evaluated += 1
         inserted += created
         outcomes.append({'rule_id': rule['_id'], 'matching_sources': matches, 'alerts_created': created})

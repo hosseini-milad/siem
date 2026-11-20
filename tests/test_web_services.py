@@ -1,4 +1,5 @@
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hmac
 import json
@@ -7,6 +8,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from app.api.access import COOKIE
 from app.core.config import Settings
 from app.main import create_app
 from scripts.collect_web_logs import BOUNDS, aggregate
@@ -106,6 +108,60 @@ def test_web_access_collection_and_signed_replay(tmp_path):
             assert client.post(url, content=heartbeat, headers=headers).status_code == 202
             assert json.loads(heartbeat)['status_codes'] == {}
             assert records.count_documents({}) == 2
+        finally:
+            db.client.drop_database(config.mongodb_database)
+
+
+def test_unauthenticated_protected_requests_trigger_a07_after_collection(tmp_path):
+    path = tmp_path / 'access.jsonl'
+    secret = 'test-collector-key-for-session-failures'
+    config = Settings(mongodb_database='siem_test_' + uuid4().hex, ml_model_dir=str(tmp_path / 'model'),
+                      auth_required=True, web_access_log_path=str(path), web_local_collector_enabled=False,
+                      web_collector_keys={'siem-api': secret})
+    with TestClient(create_app(config), client=('192.0.2.1', 50000)) as client, \
+            closing(sqlite3.connect(':memory:')) as queue:
+        db = client.app.state.database
+        try:
+            queue.executescript('''
+                CREATE TABLE cursor (id INTEGER PRIMARY KEY, device INTEGER, inode INTEGER, offset INTEGER);
+                CREATE TABLE pending (id TEXT PRIMARY KEY, interval_end INTEGER, payload BLOB);
+            ''')
+
+            def deliver():
+                aggregate(queue, path, 'siem-api', datetime.now(timezone.utc), 1000)
+                (payload,), = queue.execute('SELECT payload FROM pending').fetchall()
+                response = client.post('/api/v1/web-services/batches', content=payload, headers={
+                    'X-SIEM-Service': 'siem-api',
+                    'X-SIEM-Signature': hmac.digest(secret.encode(), payload, 'sha256').hex(),
+                })
+                assert response.status_code == 202, response.text
+                with queue:
+                    queue.execute('DELETE FROM pending')
+
+            protected = '/api/v1/web-services/status'
+            rejected = [client.get(protected) for _ in range(4)]
+            assert all(response.status_code == 401 for response in rejected)
+            deliver()
+            assert db.siem_alerts.count_documents({'owasp_category': 'A07'}) == 0
+
+            rejected.append(client.get(protected))
+            assert rejected[-1].status_code == 401
+            deliver()
+            alert = db.siem_alerts.find_one({'owasp_category': 'A07'})
+            assert alert is not None
+            assert alert['evidence']['observed_count'] == 5
+            assert alert['evidence']['source_ip'] == '192.0.2.1'
+            evidence = db['web-records'].find({'_id': {'$in': alert['evidence']['web_record_ids']}})
+            assert {record['request_id'] for record in evidence} == {
+                response.headers['x-request-id'] for response in rejected
+            }
+
+            client.cookies.set(COOKIE, 'invalid-private-session')
+            assert client.get(protected).status_code == 401
+            deliver()
+            assert db['web-records'].count_documents({'security_event': 'login_failure', 'route': protected}) == 6
+            assert db.siem_alerts.count_documents({'owasp_category': 'A07'}) == 1
+            assert 'invalid-private-session' not in path.read_text()
         finally:
             db.client.drop_database(config.mongodb_database)
 

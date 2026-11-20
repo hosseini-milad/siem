@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -20,7 +20,9 @@ def create_alert(body: AlertCreate, database: DB):
         ids = siem.require_links(database.log_events, body.event_ids)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    return siem.create(database.siem_alerts, {**body.model_dump(), 'event_ids': ids, 'kind': 'manual', 'status': 'open'})
+    identity = str(uuid4())
+    service.emit_alert(database, identity, {**body.model_dump(exclude_none=True), 'event_ids': ids, 'kind': 'manual'})
+    return siem.public(database.siem_alerts.find_one({'_id': identity}))
 
 
 @router.get('/alerts', tags=['Alerts'], summary='فهرست و فیلتر هشدارها')

@@ -27,7 +27,7 @@ DEFAULTS = {
     'logging_health': {**BASE_RULE, 'threshold': 3},
 }
 REQUEST_RULES = {
-    'login_failure': ('login_failure', 401, 'A07', 'Repeated web login failures'),
+    'login_failure': ('login_failure', 401, 'A07', 'Repeated web authentication failures'),
     'access_denied': ('access_denied', 403, 'A01', 'Repeated web access denials'),
 }
 LOGGER = logging.getLogger('uvicorn.error.owasp')
@@ -103,17 +103,18 @@ def inspect_batch(database, service, events, now):
             subject = identity if identity in subjects else None
             address = None if subject else identity
             evidence_match = {**match, 'auth_subject': subject, **({'source_ip': address} if address else {})}
-            ids = [item['record_id'] for item in records.aggregate([
+            evidence = list(records.aggregate([
                 {'$match': evidence_match},
                 {'$sort': {'timestamp': -1, '_id': -1}},
                 {'$group': {'_id': '$request_id', 'record_id': {'$first': '$_id'},
                             'timestamp': {'$first': '$timestamp'}}},
                 {'$sort': {'timestamp': -1, 'record_id': -1}},
                 {'$limit': 20},
-            ], maxTimeMS=10000)]
+            ], maxTimeMS=10000))
             created += emit_finding(database, key, service, identity, now, rule, category, title, {
                 'source_ip': address, 'auth_subject': subject, 'observed_count': row['count'],
-                'threshold': rule['threshold'], 'web_record_ids': ids,
+                'threshold': rule['threshold'], 'web_record_ids': [item['record_id'] for item in evidence],
+                'occurred_at': evidence[0]['timestamp'] if evidence else None,
             })
     return created
 
@@ -133,10 +134,12 @@ def inspect_signals(database, service, signals, now):
         query = {'service': service, 'signal': signal, 'timestamp': {'$gte': start, '$lte': now}}
         count = collection.count_documents(query, maxTimeMS=10000)
         if count >= rule['threshold']:
-            ids = [row['_id'] for row in collection.find(query, {'_id': 1})
-                   .sort([('timestamp', -1), ('_id', -1)]).limit(20).max_time_ms(10000)]
+            evidence = list(collection.find(query, {'timestamp': 1})
+                            .sort([('timestamp', -1), ('_id', -1)]).limit(20).max_time_ms(10000))
             created += emit_finding(database, key, service, signal, now, rule, category, title, {
-                'signal': signal, 'observed_count': count, 'threshold': rule['threshold'], 'security_signal_ids': ids,
+                'signal': signal, 'observed_count': count, 'threshold': rule['threshold'],
+                'security_signal_ids': [row['_id'] for row in evidence],
+                'occurred_at': evidence[0]['timestamp'] if evidence else None,
             })
     return created
 

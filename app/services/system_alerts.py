@@ -117,7 +117,7 @@ def evaluate(database, now, candidates=None):
         if not scope or (relevant is not None and (event_id, scope) not in relevant):
             continue
         if row['timestamp'] >= now - timedelta(minutes=rule['window_minutes']):
-            groups[event_id, scope].append(row['_id'])
+            groups[event_id, scope].append(row)
 
     created = 0
     for (event_id, scope), evidence in groups.items():
@@ -134,7 +134,9 @@ def evaluate(database, now, candidates=None):
             'evidence': {
                 'rule': key, 'windows_event_id': event_id, 'channel': 'Security',
                 'observed_count': len(evidence), 'threshold': rule['threshold'],
-                'window_minutes': rule['window_minutes'], 'agent_log_ids': evidence[:20],
+                'window_minutes': rule['window_minutes'], 'agent_log_ids': [row['_id'] for row in evidence[:20]],
+                'occurred_at': evidence[0]['timestamp'],
+                **({'source_ip': actor.removeprefix('ip:')} if actor.startswith('ip:') else {}),
             },
         }, collection_name=COOLDOWNS)
     return {'alerts_created': created, 'request_rules_skipped': False,

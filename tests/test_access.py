@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings
 from app.main import create_app
 from app.services.access import COOKIE, password_hash, token_digest
+from app.services.alert_tasks import reconcile, task_id
+from app.services.alerts import emit_alert
 
 PASSWORD = 'test-passphrase-123'
 
@@ -29,6 +31,56 @@ def application(tmp_path):
 
 def login(client, username):
     return client.post('/api/v1/auth/login', json={'username': username, 'password': PASSWORD})
+
+
+def test_alerts_create_one_task_on_the_respective_admin_board(application):
+    manager, app = application
+    db = app.state.database
+    assert login(manager, 'manager').status_code == 200
+    branches = manager.get('/api/v1/users/branches').json()['items']
+    assert {branch['id'] for branch in branches} == {'web', 'network', 'system'}
+
+    def create_admin(domain, username):
+        return manager.post('/api/v1/users', json={
+            'username': username, 'name': username, 'password': PASSWORD, 'branch': domain,
+        })
+
+    network = create_admin('network', 'network-admin')
+    system = create_admin('system', 'system-admin')
+    assert network.status_code == system.status_code == 201
+    assert create_admin('network', 'other-network').status_code == 409
+
+    network_alert = manager.post('/api/v1/alerts', json={'title': 'Manual review', 'description': 'Review'})
+    assert network_alert.status_code == 201
+    network_id = network_alert.json()['id']
+    data = {'title': 'Threshold reached', 'description': 'Review the evidence', 'severity': 'critical',
+            'source': 'test', 'kind': 'test', 'event_ids': []}
+    system_id, web_id = str(uuid4()), str(uuid4())
+    assert emit_alert(db, system_id, {**data, 'domain': 'system'})
+    assert emit_alert(db, web_id, {**data, 'domain': 'web', 'evidence': {'source_ip': '192.0.2.1'}})
+    assert not emit_alert(db, web_id, {**data, 'domain': 'web'})
+    assert db.tasks.count_documents({'alert.id': web_id}) == 1
+    central = manager.get('/api/v1/tasks/' + task_id(web_id)).json()
+    assert central['routing_pending'] and central['assignees'] == [] and central['priority'] == 'urgent'
+
+    web = create_admin('web', 'web-admin')
+    assert web.status_code == 201
+    reconcile(db)
+    for created, alert_id in ((network, network_id), (system, system_id), (web, web_id)):
+        account = created.json()
+        admin = TestClient(app, base_url='https://testserver')
+        assert login(admin, account['username']).status_code == 200
+        cards = admin.get('/api/v1/tasks', params={'board': account['id']}).json()['items']
+        assert len(cards) == 1
+        card, = cards
+        assert card['alert']['id'] == alert_id and card['can_view_alert'] and not card['routing_pending']
+        assert [person['id'] for person in card['assignees']] == [account['id']]
+        assert admin.get(f'/api/v1/alerts/{alert_id}').status_code == 200
+        assert admin.get(f'/api/v1/alerts/{alert_id}/evidence').status_code == 200
+        other_alert = network_id if alert_id != network_id else system_id
+        assert admin.get(f'/api/v1/alerts/{other_alert}/evidence').status_code == 403
+        assert admin.get('/api/v1/alerts').status_code == 403
+        assert admin.get('/api/v1/tasks/' + task_id(other_alert)).status_code == 404
 
 
 def test_roles_grants_and_session_revocation(application):
@@ -120,7 +172,9 @@ def test_branch_hierarchy_and_system_profiles(application):
 
     east, west = endpoints
     operator = operators[0]
-    assert operator.patch('/api/v1/auth/branch', json={'branch': 'Eastern office'}).status_code == 200
+    assert operator.patch('/api/v1/auth/branch', json={'branch': 'Eastern office'}).status_code == 403
+    assert manager.patch('/api/v1/users/' + operator.get('/api/v1/auth/me').json()['id'],
+                         json={'branch': 'Eastern office'}).status_code == 200
     assert [row['id'] for row in operator.get('/api/v1/users').json()['items']] == [east]
     assert [row['id'] for row in operator.get('/api/v1/device-health').json()['items']] == [east]
     profile = {'name': 'Host A', 'type': 'server', 'threshold': 75}
