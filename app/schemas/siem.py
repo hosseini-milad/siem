@@ -52,6 +52,14 @@ class WebAlertSettings(StrictBody):
     logging_health: WebAlertRule | None = None
 
 
+class SystemAlertSettings(StrictBody):
+    logon_failure: WebAlertRule
+    account_lockout: WebAlertRule
+    audit_log_cleared: WebAlertRule
+    audit_policy_changed: WebAlertRule
+    service_installed: WebAlertRule
+
+
 class AlertUpdate(StrictBody):
     status: AlertStatus
 

@@ -222,3 +222,55 @@ def test_operational_overview_separates_alerts_logs_and_web_totals(setup):
     assert len(data['log_series']) >= 24
     daily = client.get('/api/v1/overview/operations', params={'hours': 168}).json()
     assert daily['interval'] == 'day' and daily['alert_totals']['web'] == 2
+
+
+def test_windows_thresholds_ingestion_evidence_and_backfill(setup):
+    client, db = setup
+    settings_path = '/api/v1/alerts/settings/system'
+    defaults = client.get(settings_path).json()
+    assert defaults['logon_failure']['threshold'] == 8
+    assert defaults['logon_failure']['window_minutes'] == 4
+    assert defaults['audit_log_cleared']['threshold'] == 1
+    timestamp = datetime.now(timezone.utc) - timedelta(seconds=2)
+
+    def windows_log(event_id, record_number, channel='Security', **fields):
+        return {'log': channel, 'event_id': event_id, 'record_number': record_number,
+                'time': timestamp.isoformat(), 'event_data': fields}
+
+    def submit(logs):
+        response = client.post('/logs', json={'agent_id': 'win-01', 'logs': logs,
+                                              'system_info': {'mac_address': '02:00:00:00:00:01'}})
+        assert response.status_code == 201, response.text
+
+    submit([windows_log(4625, n, IpAddress='192.0.2.31') for n in range(7)] + [
+        windows_log(4625, 10, IpAddress='192.0.2.32'),
+        windows_log(4625, 11, 'Application', IpAddress='192.0.2.31'),
+    ])
+    assert db.siem_alerts.count_documents({'domain': 'system'}) == 0
+    burst = windows_log(4625, 12, IpAddress='192.0.2.31')
+    submit([burst])
+    submit([burst])
+    submit([windows_log(event_id, 20 + index) for index, event_id in enumerate((1102, 4740, 4719, 4697))])
+    alerts = client.get('/api/v1/alerts', params={'domain': 'system'}).json()['items']
+    assert len(alerts) == 5
+    failure = next(item for item in alerts if item['evidence']['windows_event_id'] == 4625)
+    assert failure['evidence']['observed_count'] == 8
+    assert failure['source'] == '02:00:00:00:00:01'
+    items = client.get(f"/api/v1/alerts/{failure['id']}/evidence").json()['items']
+    assert len(items) == 8 and all(row['collection'] == 'agent_logs' for row in items)
+    assert all(row['record']['IpAddress'] == '192.0.2.31' for row in items)
+    assert client.get('/api/v1/alerts/summary', params={'domain': 'system'}).json()['total'] == 5
+
+    defaults['service_installed']['enabled'] = False
+    assert client.put(settings_path, json=defaults).status_code == 200
+    db.agent_logs.insert_many([
+        {'_id': 'historic-policy', 'Channel': 'SeCuRiTy', 'EventID': '4719',
+         'timestamp': timestamp, 'agent_id': 'win-02'},
+        {'_id': 'historic-service', 'Channel': 'Security', 'EventID': '4697',
+         'timestamp': timestamp, 'agent_id': 'win-02'},
+    ])
+    replay = client.post('/api/v1/alerts/system/evaluate').json()
+    assert replay['alerts_created'] == 1
+    assert db.siem_alerts.count_documents({'source': 'win-02', 'evidence.windows_event_id': 4719}) == 1
+    assert db.siem_alerts.count_documents({'source': 'win-02', 'evidence.windows_event_id': 4697}) == 0
+    assert client.post('/api/v1/alerts/system/evaluate').json()['alerts_created'] == 0

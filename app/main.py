@@ -32,6 +32,7 @@ from app.services.raw_logs import listen_for_raw_logs
 from app.services.owasp_signals import COLLECTION as WEB_SECURITY_SIGNALS
 from app.services.web_alerts import COOLDOWNS, monitor_collectors
 from app.services.web_access import WebAccessLog, access_log_handler, local_web_collector
+from app.services.system_alerts import COOLDOWNS as SYSTEM_ALERT_COOLDOWNS
 from app.services.system_log_ml import AGENT_LOG_LABELS, SystemLogModelManager
 
 
@@ -131,6 +132,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 labeled_logs.create_index([("predicted_label", 1), *LOG_ORDER])
                 app.state.database[AGENT_LOGS].create_index([("system_id", 1), ("timestamp", -1)])
                 app.state.database[AGENT_LOGS].create_index([("event_id", 1), ("timestamp", -1)])
+                app.state.database[AGENT_LOGS].create_index([("EventID", 1), ("timestamp", -1)])
+                app.state.database[SYSTEM_ALERT_COOLDOWNS].create_index(
+                    "last_triggered_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database[SYSTEM_METRICS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database[SYSTEM_METRICS].create_index([("system_id", 1), ("received_at", -1)])
                 app.state.database[SYSTEMS].create_index("mac", unique=True)

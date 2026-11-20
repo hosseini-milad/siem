@@ -5,9 +5,9 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.db.session import DB
-from app.schemas.siem import AlertCreate, AlertStatus, AlertUpdate, PredictionAlerts, Severity, SystemAlertCreate, WebAlertSettings
+from app.schemas.siem import AlertCreate, AlertStatus, AlertUpdate, PredictionAlerts, Severity, SystemAlertCreate, SystemAlertSettings, WebAlertSettings
 from app.services import alerts as service
-from app.services import siem, web_alerts
+from app.services import siem, system_alerts, web_alerts
 
 AlertDomain = Literal['network', 'system', 'web']
 
@@ -69,6 +69,25 @@ def evaluate_owasp(request: Request, database: DB, service: str | None = Query(N
         raise HTTPException(404, 'Web collector is not registered')
     return web_alerts.evaluate_current(database, (service,) if service else tuple(configured),
                                        datetime.now(timezone.utc))
+
+
+@router.get('/alerts/settings/system', tags=['Alerts'], response_model=SystemAlertSettings,
+            summary='خواندن آستانه‌های هشدار Windows Security')
+def system_settings(database: DB):
+    return system_alerts.settings(database)
+
+
+@router.put('/alerts/settings/system', tags=['Alerts'], response_model=SystemAlertSettings,
+            summary='ذخیرهٔ آستانه‌های هشدار Windows Security')
+def update_system_settings(body: SystemAlertSettings, database: DB):
+    values = body.model_dump()
+    database[system_alerts.SETTINGS].update_one({'_id': 'default'}, {'$set': values}, upsert=True)
+    return values
+
+
+@router.post('/alerts/system/evaluate', tags=['Alerts'], summary='ارزیابی لاگ موجود با قواعد Windows Security')
+def evaluate_system(database: DB):
+    return system_alerts.evaluate(database, datetime.now(timezone.utc))
 
 
 @router.get('/alerts/{alert_id}', tags=['Alerts'])

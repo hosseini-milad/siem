@@ -12,6 +12,7 @@ from app.schemas.log import LogBatch, LogCreate, LogLevel, LogPage, LogRead
 from app.services import logs
 from app.services.agent_ingestion import ingest_agent_payload
 from app.services.raw_logs import parse_raw_log
+from app.services.system_alerts import evaluate as evaluate_system_alerts
 from app.services.system_log_ml import predict_and_store
 
 router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
@@ -123,6 +124,7 @@ async def receive_http_log(request: Request, database: DB):
         if result["events"]:
             await run_in_threadpool(logs.store_logs, database, result["events"])
         if result["records"]:
+            await run_in_threadpool(evaluate_system_alerts, database, datetime.now(timezone.utc), result["records"])
             try:
                 await run_in_threadpool(
                     predict_and_store, database, request.app.state.system_log_ml, result["records"])

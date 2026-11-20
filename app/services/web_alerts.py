@@ -38,8 +38,8 @@ def settings(database):
     return {key: {**value, **stored.get(key, {})} for key, value in DEFAULTS.items()}
 
 
-def emit_with_cooldown(database, key, now, minutes, body):
-    state_collection = database[COOLDOWNS]
+def emit_with_cooldown(database, key, now, minutes, body, *, collection_name=COOLDOWNS):
+    state_collection = database[collection_name]
     pending = {'id': str(uuid4()), 'body': body}
     query = {'_id': key, 'pending': {'$exists': False},
              'last_triggered_at': {'$lte': now - timedelta(minutes=minutes)}}

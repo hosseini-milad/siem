@@ -100,6 +100,11 @@ def alert_evidence(db, alert):
         for collection in (AGENT_LOG_LABELS, AGENT_LOGS):
             row = db[collection].find_one({'_id': identity})
             references.append({'collection': collection, 'id': identity, 'record': siem.public(row)})
+    if alert.get('kind') == 'system_threshold':
+        ids = evidence.get('agent_log_ids', [])
+        rows = {row['_id']: row for row in db[AGENT_LOGS].find({'_id': {'$in': ids}})}
+        references.extend({'collection': AGENT_LOGS, 'id': identity, 'record': siem.public(rows.get(identity))}
+                          for identity in ids)
     if alert.get('kind') == 'web_threshold':
         for key, collection, projection in (
             ('web_record_ids', RECORDS, None),
