@@ -145,6 +145,10 @@ def test_agent_payload_creates_system_metrics_events_and_change_history(client):
     assert history["changes"]["source_ip"] == {"before": "192.0.2.91", "after": "192.0.2.92"}
     assert history["changes"]["processor"] == {"before": "Intel CPU", "after": "New CPU"}
 
+    replay = changed_sender.post("/logs", json={"agent_id": payload["agent_id"], "logs": payload["logs"]})
+    assert replay.status_code == 201 and replay.json()["inserted"] == 0
+    assert database.agent_logs.find_one({"record_number": 28766})["source_ip"] == "192.0.2.91"
+
     later_log = {
         "agent_id": payload["agent_id"], "timestamp": "2026-11-19T11:53:23+00:00",
         "logs": [{"log": "System", "record_number": 28767,

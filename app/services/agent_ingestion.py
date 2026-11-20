@@ -162,6 +162,8 @@ def root_agent_log(document, row):
     }
     if document.get("mac"):
         result["system_id"] = result["mac"] = document["mac"]
+    if document.get("device_ip"):
+        result["device_ip"] = document["device_ip"]
 
     def add_fields(fields, collision_prefix):
         for key, value in fields.items():
@@ -192,8 +194,17 @@ def store_agent_logs(database, document):
     if not unique:
         return [], []
     identifiers = list(unique)
-    existing = {row["_id"] for row in database[AGENT_LOGS].find(
-        {"_id": {"$in": identifiers}}, {"_id": 1})}
+    observation_fields = ("timestamp", "received_at", "source_ip", "source_port", "system_id", "mac", "device_ip")
+    existing = {row["_id"]: row for row in database[AGENT_LOGS].find(
+        {"_id": {"$in": identifiers}}, {key: 1 for key in observation_fields},
+    )}
+    for identifier, (raw, _) in unique.items():
+        if previous := existing.get(identifier):
+            for key in observation_fields:
+                if key in previous:
+                    raw[key] = previous[key]
+                else:
+                    raw.pop(key, None)
     database[AGENT_LOGS].bulk_write([
         ReplaceOne({"_id": raw["_id"]}, raw, upsert=True) for raw, _ in unique.values()
     ])
@@ -252,6 +263,7 @@ def ingest_agent_payload(database, payload, source_ip, source_port, received_at)
     if system:
         document["mac"] = system["mac"]
         document["system_id"] = system["_id"]
+        document["device_ip"] = system.get("ip")
     has_metrics = store_metrics(database, document, system)
     stored, inserted_rows = store_agent_logs(database, document)
     return {

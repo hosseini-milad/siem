@@ -1,12 +1,14 @@
+from datetime import datetime, timezone
 import logging
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, IPvAnyAddress
 from pymongo.errors import ExecutionTimeout, PyMongoError
 
 from app.db.session import DB
 from app.schemas.log import LogLevel
+from app.services.correlation import assess
 from app.services.explorer import list_records, list_system_records, list_web_records
 
 logger = logging.getLogger('uvicorn.error.siem.explorer')
@@ -81,3 +83,13 @@ def web_records(database: DB, filters: Annotated[WebRecordFilters, Query()]):
         return list_web_records(database, filters)
     except ExecutionTimeout as exc:
         raise HTTPException(503, 'Explorer query timed out. Try a smaller date range.') from exc
+
+
+@router.get('/correlation', summary='تحلیل بدون‌برچسب و گراف شواهد برای IP')
+def correlation(
+    database: DB, ip: IPvAnyAddress, end: AwareDatetime | None = None,
+    baseline_hours: int = Query(24, ge=8, le=144),
+    window_minutes: Literal[15, 30, 60] = 60,
+):
+    anchor = (end or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return assess(database, str(ip), anchor, baseline_hours, window_minutes)

@@ -57,6 +57,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 web_records.create_index(LOG_ORDER)
                 web_records.create_index([('service', 1), *LOG_ORDER])
                 web_records.create_index([('status', 1), *LOG_ORDER])
+                web_records.create_index([('source_ip', 1), *LOG_ORDER])
                 if config.auth_required:
                     initialize_access(app.state.database)
                 interrupted = app.state.database.normalization_runs.update_many(
@@ -104,6 +105,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                              partialFilterExpression={column: {'$exists': True}})
                 collection = app.state.database[COLLECTION]
                 collection.create_index(LOG_ORDER)
+                collection.create_index([("attributes.source_ip", 1), *LOG_ORDER])
+                collection.create_index([("attributes.destination_ip", 1), *LOG_ORDER])
                 collection.create_index([("source", 1), ("timestamp", -1)])
                 collection.create_index([("level", 1), ("timestamp", -1)])
                 collection.create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
@@ -111,6 +114,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database[PAYLOADS].create_index([("agent_id", 1), ("timestamp", -1)])
                 app.state.database[AGENT_LOGS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database[AGENT_LOGS].create_index(LOG_ORDER)
+                app.state.database[AGENT_LOGS].create_index([("source_ip", 1), *LOG_ORDER])
+                app.state.database[AGENT_LOGS].create_index([("device_ip", 1), *LOG_ORDER])
                 labeled_logs = app.state.database[AGENT_LOG_LABELS]
                 labeled_logs.create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 labeled_logs.create_index(LOG_ORDER)
