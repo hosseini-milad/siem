@@ -133,5 +133,29 @@ async def receive_batch(request: Request, database: DB):
 def recent_batches(database: DB, service: Source | None = None, limit: int = Query(10, ge=1, le=30)):
     query = {'service': service} if service else {}
     items = list(database[COLLECTION].find(query, {'digest': 0}).sort(
-        [('interval_end', -1), ('_id', -1)]).limit(limit))
+        [('interval_end', -1), ('received_at', -1), ('_id', -1)]).limit(limit))
     return {'histogram_upper_bounds_ms': HISTOGRAM_BOUNDS_MS, 'items': items}
+
+
+@router.get('/api/v1/web-services/status', summary='سرویس‌های ثبت‌شده و آخرین دریافت لاگ وب')
+def collector_status(request: Request, database: DB):
+    config = request.app.state.settings
+    now = datetime.now(timezone.utc)
+    items = []
+    for service in sorted(config.web_collector_keys):
+        latest = database[COLLECTION].find_one(
+            {'service': service}, {'_id': 0, 'interval_end': 1, 'received_at': 1,
+                                   'status_codes': 1, 'omitted_details': 1, 'invalid_lines': 1},
+            sort=[('interval_end', -1), ('received_at', -1), ('_id', -1)],
+        )
+        item = {'service': service, 'state': 'awaiting_first_batch'}
+        if latest:
+            total = sum(latest['status_codes'].values())
+            current = latest['interval_end'] >= now - timedelta(minutes=3)
+            item.update(state='receiving' if current else 'no_recent_batch',
+                        last_received_at=latest['received_at'], last_interval_end=latest['interval_end'],
+                        requests=total, details=total - latest['omitted_details'],
+                        invalid_lines=latest['invalid_lines'])
+        items.append(item)
+    return {'local_logging_enabled': bool(config.web_access_log_path),
+            'interval_seconds': 60, 'items': items}

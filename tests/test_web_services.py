@@ -16,15 +16,23 @@ def test_web_access_collection_and_signed_replay(tmp_path):
     secret = 'test-collector-secret-only-for-tests'
     config = Settings(mongodb_database='siem_test_' + uuid4().hex,
                       ml_model_dir=str(tmp_path / 'model'),
-                      web_access_log_path=str(path), web_collector_keys={'siem-api': secret})
+                      web_access_log_path=str(path), web_collector_keys={'siem-api': secret, 'remote-api': 'another-test-key'})
     app = create_app(config)
     with TestClient(app) as client:
         db = app.state.database
         try:
+            status_url = '/api/v1/web-services/status'
+            status = client.get(status_url).json()
+            assert status['local_logging_enabled'] and status['interval_seconds'] == 60
+            assert status['items'] == [
+                {'service': 'remote-api', 'state': 'awaiting_first_batch'},
+                {'service': 'siem-api', 'state': 'awaiting_first_batch'},
+            ]
+            assert secret not in str(status)
             response = client.get('/api/v1/health?hidden=private-value',
                                   headers={'Authorization': 'Bearer private-value'})
             assert response.status_code == 200
-            generated = json.loads(path.read_text())
+            generated = json.loads(path.read_text().splitlines()[-1])
             assert generated['route'] == '/api/v1/health'
             assert generated['request_id'] == response.headers['x-request-id']
             assert 'private-value' not in path.read_text()
@@ -50,6 +58,9 @@ def test_web_access_collection_and_signed_replay(tmp_path):
             aggregate(conn, path, 'siem-api', end, 1000)
             aggregate(conn, path, 'siem-api', end, 1000)
             (payload,), = conn.execute('SELECT payload FROM pending').fetchall()
+            conn.execute('DELETE FROM pending')
+            aggregate(conn, path, 'siem-api', end, 1000, heartbeat=True)
+            (heartbeat,), = conn.execute('SELECT payload FROM pending').fetchall()
             conn.close()
 
             url = '/api/v1/web-services/batches'
@@ -68,9 +79,9 @@ def test_web_access_collection_and_signed_replay(tmp_path):
             stored = client.get(url, params={'service': 'siem-api'}).json()
             assert stored['histogram_upper_bounds_ms'] == list(BOUNDS)
             batch, = stored['items']
-            assert batch['status_codes'] == {'200': 1, '401': 1, '503': 1}
-            assert sum(batch['latency_buckets']) == 3 and batch['latency_buckets'][4] == 1
-            assert batch['omitted_details'] == 1
+            assert batch['status_codes'] == {'200': 2, '401': 1, '503': 1}
+            assert sum(batch['latency_buckets']) == 4 and batch['latency_buckets'][4] >= 1
+            assert batch['omitted_details'] == 2
             detail = next(row for row in batch['events'] if row['status'] == 503)
             assert 'response_body' not in detail and detail['request_body_fields'] == ['id']
             assert detail['response_headers'] == {'content_type': 'application/json'}
@@ -85,6 +96,13 @@ def test_web_access_collection_and_signed_replay(tmp_path):
             records.delete_one({'status': 503})
             headers['X-SIEM-Signature'] = hmac.digest(secret.encode(), payload, 'sha256').hex()
             assert client.post(url, content=payload, headers=headers).json()['duplicate']
+            assert records.count_documents({}) == 2
+            status = client.get(status_url).json()['items'][1]
+            assert status['state'] == 'receiving'
+            assert status['requests'] == 4 and status['details'] == 2
+            headers['X-SIEM-Signature'] = hmac.digest(secret.encode(), heartbeat, 'sha256').hex()
+            assert client.post(url, content=heartbeat, headers=headers).status_code == 202
+            assert json.loads(heartbeat)['status_codes'] == {}
             assert records.count_documents({}) == 2
         finally:
             db.client.drop_database(config.mongodb_database)

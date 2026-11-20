@@ -100,7 +100,7 @@ def open_current(db, path):
         yield current, identity, offset
 
 
-def aggregate(db, path, service, end, slow_ms):
+def aggregate(db, path, service, end, slow_ms, *, heartbeat=False):
     if db.execute('SELECT coalesce(sum(length(payload)), 0) FROM pending').fetchone()[0] >= MAX_OUTBOX:
         print('outbox is full; waiting before reading more input', file=sys.stderr)
         return
@@ -143,7 +143,7 @@ def aggregate(db, path, service, end, slow_ms):
     with db:
         if checkpoint:
             db.execute('INSERT OR REPLACE INTO cursor VALUES (1, ?, ?, ?)', checkpoint)
-        if not codes and not invalid:
+        if not heartbeat and not codes and not invalid:
             return
         events = (critical + regular)[:300]
         identifier = str(uuid4())
@@ -171,6 +171,11 @@ def flush(db, opener, target, service, secret):
                     receipt = json.loads(response.read(4096))
                     if response.status != 202 or not isinstance(receipt, dict) or receipt.get('batch_id') != identifier:
                         raise ValueError('unexpected batch acknowledgment')
+                    batch = json.loads(payload)
+                    total = sum(batch['status_codes'].values())
+                    print(f"{service}: HTTP 202, batch={identifier}, requests={total}, "
+                          f"details={len(batch['events'])}, invalid_lines={batch['invalid_lines']}, "
+                          f"duplicate={receipt.get('duplicate', False)}", flush=True)
             except (HTTPError, URLError, OSError, ValueError) as error:
                 print(f'batch {identifier} kept for retry: {error}', file=sys.stderr)
                 return
@@ -213,7 +218,7 @@ def main():
             end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
             read_failed = False
             try:
-                aggregate(db, args.source, args.service, end, args.slow_ms)
+                aggregate(db, args.source, args.service, end, args.slow_ms, heartbeat=True)
             except OSError as error:
                 read_failed = True
                 print(f'could not read input: {error}', file=sys.stderr)

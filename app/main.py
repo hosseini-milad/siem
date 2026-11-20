@@ -50,8 +50,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 client.admin.command("ping")
                 batches = app.state.database[web_services.COLLECTION]
                 batches.create_index('received_at', expireAfterSeconds=web_services.RETENTION)
-                batches.create_index([('interval_end', -1), ('_id', -1)])
-                batches.create_index([('service', 1), ('interval_end', -1), ('_id', -1)])
+                batches.create_index([('interval_end', -1), ('received_at', -1), ('_id', -1)])
+                batches.create_index([('service', 1), ('interval_end', -1), ('received_at', -1), ('_id', -1)])
                 web_records = app.state.database[web_services.RECORDS]
                 web_records.create_index('received_at', expireAfterSeconds=web_services.RETENTION)
                 web_records.create_index(LOG_ORDER)
