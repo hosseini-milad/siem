@@ -101,7 +101,8 @@ def test_agent_payload_creates_system_metrics_events_and_change_history(client):
                         "total_ram_gb": 15.89, "total_disk_c_gb": 159.88,
                         "mac_address": "78:24:AF:CB:1B:FD"},
     }
-    assert client.post("/logs", json=payload).status_code == 201
+    sender = TestClient(client.app, client=("192.0.2.91", 40000))
+    assert sender.post("/logs", json=payload).status_code == 201
     database = client.app.state.database
     assert database.agent_payloads.count_documents({}) == 0
     stored = database.agent_logs.find_one({"agent_id": payload["agent_id"]})
@@ -123,20 +124,25 @@ def test_agent_payload_creates_system_metrics_events_and_change_history(client):
     assert event_row["level"] == "WARNING"
     assert event_row["timestamp"].isoformat() == "2026-11-19T08:21:18.434000+00:00"
     event_count = database.log_events.count_documents({})
-    repeated = client.post("/logs", json=payload).json()
+    repeated = sender.post("/logs", json=payload).json()
     assert repeated == {"accepted": True, "logs": 1, "inserted": 0, "metrics": True}
     assert database.agent_logs.count_documents({}) == 1
     assert database.log_events.count_documents({}) == event_count
 
     changed = {**payload, "logs": [], "metrics": {**payload["metrics"], "cpu_percent": 21.5},
                "system_info": {**payload["system_info"], "processor": "New CPU"}}
-    changed_response = client.post("/logs", json=changed)
+    changed_sender = TestClient(client.app, client=("192.0.2.92", 40000))
+    changed_response = changed_sender.post("/logs", json=changed)
     assert changed_response.status_code == 201
     assert changed_response.json() == {"accepted": True, "logs": 0, "inserted": 0, "metrics": True}
     assert database.agent_logs.count_documents({}) == 1
     assert database.log_events.count_documents({}) == event_count
     assert database.systems.find_one(mac)["processor"] == "New CPU"
+    assert database.systems.count_documents({}) == 1
+    assert database.systems.find_one(mac)["source_ip"] == "192.0.2.92"
+    assert database.system_changes.count_documents({"system_id": mac}) == 1
     history = database.system_changes.find_one({"system_id": mac})
+    assert history["changes"]["source_ip"] == {"before": "192.0.2.91", "after": "192.0.2.92"}
     assert history["changes"]["processor"] == {"before": "Intel CPU", "after": "New CPU"}
 
     later_log = {

@@ -122,7 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database[SYSTEM_METRICS].create_index([("system_id", 1), ("received_at", -1)])
                 app.state.database[SYSTEMS].create_index("mac", unique=True)
                 app.state.database[SYSTEMS].create_index([("agent_id", 1), ("last_seen", -1)])
-                app.state.database[SYSTEM_CHANGES].create_index([("system_id", 1), ("changed_at", -1)])
+                app.state.database[SYSTEM_CHANGES].create_index([("system_id", 1), ("changed_at", -1), ("_id", -1)])
                 bootstrap_systems(app.state.database)
                 try:
                     app.state.system_log_ml.load(app.state.database)

@@ -120,10 +120,10 @@ def test_branch_hierarchy_and_system_profiles(application):
     assert operator.patch('/api/v1/auth/branch', json={'branch': 'Eastern office'}).status_code == 200
     assert [row['id'] for row in operator.get('/api/v1/users').json()['items']] == [east]
     assert [row['id'] for row in operator.get('/api/v1/device-health').json()['items']] == [east]
-    profile = {'name': 'Host A', 'ip': '192.0.2.1', 'type': 'server', 'threshold': 75}
+    profile = {'name': 'Host A', 'type': 'server', 'threshold': 75}
     assert operator.patch(f'/api/v1/device-health/{west}', json=profile).status_code == 404
     assert operator.patch(f'/api/v1/users/{west}', json={'name': 'Unauthorized'}).status_code == 404
-    invalid = operator.patch(f'/api/v1/device-health/{east}', json={**profile, 'mac': 'invalid'})
+    invalid = operator.patch(f'/api/v1/device-health/{east}', json={**profile, 'ip': '192.0.2.1'})
     assert invalid.status_code == 422
     assert operator.patch(f'/api/v1/device-health/{east}', json=profile).status_code == 200
     assert operator.patch(f'/api/v1/users/{east}', json={'name': 'Updated', 'username': 'new-host'}).status_code == 200
@@ -173,7 +173,7 @@ def test_discovered_system_can_be_assigned_and_supplies_live_health(application)
     }}})
     account = admin.get('/api/v1/users').json()['items'][0]
     assert account['system_id'] == mac
-    assert account['system']['name'] == 'اتاق ۱۰۳' and account['system']['ip'] == '192.168.1.13'
+    assert account['system']['name'] == 'اتاق ۱۰۳' and account['system']['ip'] == '127.0.0.1'
     assert account['system']['mac'] == mac and account['system']['os'] == 'Windows 10'
     assert account['system']['processor'] == 'Intel CPU'
     health = admin.get('/api/v1/device-health').json()['items'][0]
@@ -183,6 +183,23 @@ def test_discovered_system_can_be_assigned_and_supplies_live_health(application)
     listed = admin.get('/api/v1/systems').json()['items'][0]
     assert listed['mac'] == mac and listed['cpu_percent'] == 7.71
     assert listed['assigned_user']['id'] == user_id
+    change_path = f'/api/v1/device-health/{user_id}/changes'
+    assert admin.get(change_path).json()['total'] == 0
+    assert admin.patch(f'/api/v1/device-health/{user_id}', json={'threshold': 81}).json()['system']['name'] == 'اتاق ۱۰۳'
+    agent = TestClient(app, base_url='https://testserver', client=('192.168.1.99', 50000))
+    agent.cookies.update(manager.cookies)
+    receipt = agent.post('/logs', json={'agent_id': 'DESKTOP-88EQ9K3', 'system_info': {
+        'mac_address': '78-24-AF-CB-1B-FD', 'ip_address': '192.168.1.14', 'processor': 'Updated CPU',
+    }})
+    assert receipt.status_code == 201, receipt.text
+    updated = admin.get('/api/v1/device-health').json()['items'][0]['system']
+    assert updated['ip'] == '192.168.1.14' and updated['name'] == 'اتاق ۱۰۳' and updated['threshold'] == 81
+    assert updated['processor'] == 'Updated CPU'
+    assert admin.get(change_path).json()['items'][0]['changes']['source_ip'] == {
+        'before': '127.0.0.1', 'after': '192.168.1.99',
+    }
+    assert admin.get('/api/v1/device-health/unknown/changes').status_code == 404
+
     assert admin.patch(f'/api/v1/systems/{mac}', json={'hostname': 'changed'}).status_code == 404
     assert admin.patch(f'/api/v1/users/{user_id}', json={'system_id': None}).status_code == 200
     assert admin.get('/api/v1/users').json()['items'][0]['system_id'] is None

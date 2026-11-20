@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
 from hashlib import sha256
+from ipaddress import ip_address
 import json
 import re
 from uuid import uuid4
 
-from pymongo import ReplaceOne, ReturnDocument
+from pymongo import ReplaceOne
+from pymongo.errors import DuplicateKeyError
 
 from app.schemas.log import LogCreate, LogLevel
 
@@ -70,35 +72,54 @@ def payload_document(payload, source_ip, source_port, received_at):
     return document
 
 
+def reported_ip(info):
+    for key in ("ip_address", "local_ip", "ip"):
+        value = info.get(key)
+        if isinstance(value, str) and "%" not in value:
+            try:
+                return str(ip_address(value.strip()))
+            except ValueError:
+                continue
+    return None
+
+
 def update_system(database, document):
     info = document["system_info"]
-    mac = normalize_mac(info.get("mac_address"))
-    query = {"mac": mac} if mac else {"agent_id": document["agent_id"]}
-    existing = database[SYSTEMS].find_one(query, sort=[("last_seen", -1)])
-    if not mac and not existing:
-        return None
-    mac = mac or existing["mac"]
-    profile = {key: info[key] for key in SYSTEM_INFO_FIELDS if key in info}
-    changes = {
-        key: {"before": existing.get(key), "after": value}
-        for key, value in profile.items() if existing and existing.get(key) != value
-    }
-    update = {
-        "mac": mac, "agent_id": document["agent_id"], "last_seen": document["received_at"],
-        "source_ip": document["source_ip"], **profile,
-    }
-    system = database[SYSTEMS].find_one_and_update(
-        {"mac": mac}, {"$set": update, "$unset": {key: "" for key in METRIC_FIELDS}, "$setOnInsert": {
-            "_id": mac, "first_seen": document["received_at"], "type": "desktop", "threshold": 70,
-        }}, upsert=True, return_document=ReturnDocument.AFTER,
-    )
+    mac = document.get("mac")
+    systems = database[SYSTEMS]
+    if not mac:
+        matches = list(systems.find({"agent_id": document["agent_id"]}, {"mac": 1}).limit(2))
+        if len(matches) != 1:
+            return None
+        mac = matches[0]["mac"]
+
+    received_at = document["received_at"]
+    profile = {key: info[key] for key in SYSTEM_INFO_FIELDS if info.get(key) not in (None, "")}
+    profile["source_ip"] = document["source_ip"]
+    if address := reported_ip(info):
+        profile["ip"] = address
+    update = {"mac": mac, "agent_id": document["agent_id"], "last_seen": received_at, **profile}
+    initial = {"_id": mac, "first_seen": received_at, "type": "desktop", "threshold": 70}
+    change = {"$set": update, "$unset": {key: "" for key in METRIC_FIELDS}, "$setOnInsert": initial}
+    query = {"mac": mac, "$or": [{"last_seen": {"$lte": received_at}}, {"last_seen": None}]}
+    try:
+        previous = systems.find_one_and_update(query, change, upsert=True)
+    except DuplicateKeyError:
+        # A later payload or concurrent upsert already established this MAC.
+        previous = systems.find_one_and_update(query, change)
+        if previous is None:
+            return systems.find_one({"mac": mac})
+    if previous is None:
+        return {**initial, **update}
+
+    changes = {key: {"before": previous.get(key), "after": value}
+               for key, value in profile.items() if previous.get(key) != value}
     if changes:
         database[SYSTEM_CHANGES].insert_one({
-            "_id": uuid4().hex, "system_id": mac, "mac": mac,
-            "agent_id": document["agent_id"], "changed_at": document["received_at"],
-            "changes": changes,
+            "_id": uuid4().hex, "system_id": previous["_id"], "mac": mac,
+            "agent_id": document["agent_id"], "changed_at": received_at, "changes": changes,
         })
-    return system
+    return {**previous, **update}
 
 
 def mongo_key(value):

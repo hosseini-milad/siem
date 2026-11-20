@@ -108,17 +108,20 @@ Text = Annotated[str, Field(max_length=100)]
 Name = Annotated[str, Field(min_length=1, max_length=100)]
 
 
-class SystemProfile(BaseModel):
+class EditableSystemProfile(BaseModel):
     model_config = ConfigDict(extra='forbid', str_strip_whitespace=True)
     name: Text = ''
+    type: Literal['desktop', 'laptop', 'server', 'other'] = 'desktop'
+    threshold: int = Field(default=70, ge=1, le=100)
+
+
+class SystemProfile(EditableSystemProfile):
     ip: Annotated[str, Field(max_length=45)] = ''
     mac: Annotated[str, Field(max_length=17)] = ''
-    type: Literal['desktop', 'laptop', 'server', 'other'] = 'desktop'
     os: Text = ''
     processor: Text = ''
     memory: Text = ''
     storage: Text = ''
-    threshold: int = Field(default=70, ge=1, le=100)
 
     @field_validator('ip')
     @classmethod
@@ -165,7 +168,7 @@ class UserUpdate(BaseModel):
     name: Name | None = None
     username: Username | None = None
     branch: Name | None = None
-    system: SystemProfile | None = None
+    system: EditableSystemProfile | None = None
     active: bool | None = None
     permissions: Grants | None = None
     system_id: str | None = None
@@ -307,16 +310,17 @@ def with_branches(database, rows):
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
     for account, source in zip(result, rows):
         system = systems.get(source.get('system_id'))
+        stored_profile = source.get('system') or {}
+        manual = {key: stored_profile[key] for key in EditableSystemProfile.model_fields
+                  if key in stored_profile and stored_profile[key] is not None and stored_profile[key] != ''}
         if not system:
+            account['system'] = manual or None
             continue
         current_metrics = metrics.get(system['_id'], {})
-        stored_profile = source.get('system') or {}
-        manual = {key: stored_profile[key] for key in ('name', 'ip', 'type', 'threshold')
-                  if key in stored_profile and stored_profile[key] is not None and stored_profile[key] != ''}
         last_seen = current_metrics.get('received_at')
         account['system'] = {
             'id': system['_id'], 'mac': system['mac'], 'name': system.get('hostname') or system.get('agent_id'),
-            'ip': system.get('source_ip', ''), 'type': system.get('type', 'desktop'),
+            'ip': system.get('ip') or system.get('source_ip', ''), 'type': system.get('type', 'desktop'),
             'os': ' '.join(filter(None, [system.get('os_name'), system.get('os_release'), system.get('os_version')])),
             'processor': system.get('processor', ''),
             'architecture': system.get('architecture', ''),
@@ -374,7 +378,7 @@ def systems(user: User, database: DB, response: Response,
         'disk_write_bytes_per_sec': metrics.get(row['_id'], {}).get('disk_write_bytes_per_sec'),
         'net_sent_bytes_per_sec': metrics.get(row['_id'], {}).get('net_sent_bytes_per_sec'),
         'net_recv_bytes_per_sec': metrics.get(row['_id'], {}).get('net_recv_bytes_per_sec'),
-        'source_ip': row.get('source_ip'), 'first_seen': row.get('first_seen'),
+        'source_ip': row.get('source_ip'), 'ip': row.get('ip') or row.get('source_ip'), 'first_seen': row.get('first_seen'),
         'last_seen': metrics.get(row['_id'], {}).get('received_at'),
         'online': bool(metrics.get(row['_id'], {}).get('received_at') and
                        metrics[row['_id']]['received_at'] > cutoff),
@@ -405,15 +409,38 @@ def device_health(user: User, database: DB, response: Response,
 
 
 @router.patch('/device-health/{user_id}')
-def update_device(user_id: str, body: SystemProfile, user: User, database: DB):
+def update_device(user_id: str, body: EditableSystemProfile, user: User, database: DB):
     if user['role'] == 'client':
         raise HTTPException(403, 'ویرایش سیستم مجاز نیست.')
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(422, 'تغییری برای ذخیره وارد نشده است.')
+    scope = {'_id': user_id, **device_scope(user)}
     updated = database.users.find_one_and_update(
-        {'_id': user_id, **device_scope(user)}, {'$set': {'system': body.model_dump()}},
+        scope, [{'$set': {'system': {'$mergeObjects': [
+            '$system', {'$literal': changes},
+        ]}}}],
         return_document=ReturnDocument.AFTER)
     if not updated:
         raise HTTPException(404, 'سیستم پیدا نشد.')
     return with_branches(database, [updated])[0]
+
+
+@router.get('/device-health/{user_id}/changes')
+def device_changes(user_id: str, user: User, database: DB, response: Response,
+                   limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)):
+    account = database.users.find_one({'$and': [device_scope(user), {'_id': user_id}]}, {'system_id': 1})
+    if account is None:
+        raise HTTPException(404, 'سیستم پیدا نشد.')
+    response.headers['Cache-Control'] = 'no-store'
+    system_id = account.get('system_id')
+    if not system_id:
+        return {'items': [], 'total': 0, 'limit': limit, 'offset': offset}
+    query = {'system_id': system_id}
+    collection = database.system_changes
+    rows = collection.find(query).sort([('changed_at', -1), ('_id', -1)]).skip(offset).limit(limit)
+    return {'items': [{'id': row['_id'], 'changed_at': row['changed_at'], 'changes': row['changes']} for row in rows],
+            'total': collection.count_documents(query), 'limit': limit, 'offset': offset}
 
 
 def account_scope(user):
