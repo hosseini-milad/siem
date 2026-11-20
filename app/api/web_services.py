@@ -5,19 +5,20 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, IPvAnyAddress, StringConstraints, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, IPvAnyAddress, StringConstraints, ValidationError, field_validator
 from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError
 from starlette.concurrency import run_in_threadpool
 
 from app.db.session import DB
 from app.services.web_access import INGEST_PATH, RECORDS
-from app.services.web_alerts import inspect_batch
+from app.services.owasp_signals import BATCHES, COLLECTION as SIGNAL_COLLECTION, SIGNALS
+from app.services.web_alerts import inspect_batch, inspect_signals, inspect_metrics
 
 router = APIRouter(tags=['System'])
-COLLECTION = 'web_service_batches'
+COLLECTION = BATCHES
 RETENTION = 7 * 86400
-MAX_BODY = 512 * 1024
+MAX_BODY = 768 * 1024
 HISTOGRAM_BOUNDS_MS = (5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000)
 Counter = Annotated[int, Field(ge=0, le=1000000000)]
 Source = Annotated[str, StringConstraints(pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$')]
@@ -57,6 +58,21 @@ class RequestEvent(BaseModel):
     security_event: Literal['login_success', 'login_failure', 'access_denied', 'permission_changed'] | None = None
 
 
+class SecuritySignal(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    timestamp: AwareDatetime
+    signal_id: str = Field(pattern=r'^[a-zA-Z0-9_.:-]{1,80}$')
+    signal: str
+    detector_id: str = Field(pattern=r'^[a-zA-Z0-9_.:-]{1,80}$')
+
+    @field_validator('signal')
+    @classmethod
+    def known_signal(cls, value):
+        if value not in SIGNALS:
+            raise ValueError('Unknown OWASP signal')
+        return value
+
+
 class ServiceBatch(BaseModel):
     model_config = ConfigDict(extra='forbid')
     batch_id: UUID
@@ -69,6 +85,7 @@ class ServiceBatch(BaseModel):
     omitted_details: Counter
     invalid_lines: Counter
     events: list[RequestEvent] = Field(max_length=300)
+    security_signals: list[SecuritySignal] = Field(default_factory=list, max_length=100)
 
 
 def store_batch(database, batch, digest, received):
@@ -87,6 +104,7 @@ def store_batch(database, batch, digest, received):
         if existing is None or existing.get('digest') != digest:
             raise HTTPException(409, 'Batch ID already used for different data')
         received = existing['received_at']
+    evaluation_time = datetime.now(timezone.utc)
     if batch.events:
         operations = []
         for position, event in enumerate(batch.events):
@@ -96,7 +114,18 @@ def store_batch(database, batch, digest, received):
             operations.append(UpdateOne(
                 {'_id': f'{identity}:{position}'}, {'$setOnInsert': row}, upsert=True))
         database[RECORDS].bulk_write(operations, ordered=False)
-        inspect_batch(database, batch.service, batch.events, datetime.now(timezone.utc))
+        inspect_batch(database, batch.service, batch.events, evaluation_time)
+    if batch.security_signals:
+        writes = []
+        for signal in batch.security_signals:
+            row = signal.model_dump()
+            row.update(service=batch.service, received_at=received)
+            identifier = f'{batch.service}:{signal.signal_id}'
+            writes.append(UpdateOne({'_id': identifier}, {'$setOnInsert': row}, upsert=True))
+        database[SIGNAL_COLLECTION].bulk_write(writes, ordered=True)
+        inspect_signals(database, batch.service, batch.security_signals, evaluation_time)
+    if batch.invalid_lines or any(code.startswith('5') and count for code, count in batch.status_codes.items()):
+        inspect_metrics(database, batch.service, evaluation_time)
     return {'batch_id': batch.batch_id, 'duplicate': duplicate}
 
 

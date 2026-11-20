@@ -1,7 +1,8 @@
+from datetime import datetime, timezone
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.db.session import DB
 from app.schemas.siem import AlertCreate, AlertStatus, AlertUpdate, PredictionAlerts, Severity, SystemAlertCreate, WebAlertSettings
@@ -56,9 +57,18 @@ def web_settings(database: DB):
 @router.put('/alerts/settings/web', tags=['Alerts'], response_model=WebAlertSettings,
             summary='ذخیرهٔ آستانه‌های هشدار وب‌سرویس')
 def update_web_settings(body: WebAlertSettings, database: DB):
-    values = body.model_dump()
+    values = body.model_dump(exclude_none=True)
     database[web_alerts.SETTINGS].update_one({'_id': 'default'}, {'$set': values}, upsert=True)
-    return values
+    return web_alerts.settings(database)
+
+
+@router.post('/alerts/owasp/evaluate', tags=['Alerts'], summary='ارزیابی دادهٔ موجود با قواعد OWASP')
+def evaluate_owasp(request: Request, database: DB, service: str | None = Query(None, max_length=64)):
+    configured = request.app.state.settings.web_collector_keys
+    if service is not None and service not in configured:
+        raise HTTPException(404, 'Web collector is not registered')
+    return web_alerts.evaluate_current(database, (service,) if service else tuple(configured),
+                                       datetime.now(timezone.utc))
 
 
 @router.get('/alerts/{alert_id}', tags=['Alerts'])

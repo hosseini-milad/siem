@@ -182,3 +182,68 @@ def test_configurable_web_thresholds_count_distinct_failures_and_link_evidence(t
             assert db.siem_alerts.count_documents({'evidence.rule': 'server_error'}) == 1
         finally:
             db.client.drop_database(config.mongodb_database)
+
+
+def test_owasp_all_categories_with_isolated_signed_telemetry(tmp_path):
+    from app.services.owasp_signals import SIGNALS
+    from app.services.web_alerts import check_collectors
+
+    service = 'owasp-test'
+    key = 'dedicated-synthetic-collector-key'
+    config = Settings(mongodb_database='siem_test_' + uuid4().hex, ml_model_dir=str(tmp_path),
+                      web_collector_keys={service: key})
+    now = datetime.now(timezone.utc) - timedelta(seconds=1)
+    minute = now.replace(second=0, microsecond=0)
+    path = tmp_path / 'mixed.jsonl'
+    common = {'timestamp': now.isoformat(), 'method': 'POST', 'route': '/test',
+              'request_bytes': 10, 'response_bytes': 10, 'duration_ms': 1, 'source_ip': '192.0.2.3'}
+    rows = [
+        {**common, 'request_id': f'{status}-{index}', 'status': status, **markers}
+        for status, size, markers in (
+            (403, 5, {'security_event': 'access_denied'}),
+            (401, 5, {'security_event': 'login_failure', 'auth_subject': 'b' * 64}),
+            (503, 10, {}),
+        ) for index in range(size)
+    ]
+    rows.extend({'signal': signal, 'signal_id': f'test-{signal}', 'detector_id': 'synthetic-validation',
+                 'timestamp': now.isoformat()} for signal in SIGNALS)
+    path.write_text('\n'.join(map(json.dumps, rows)) + '\ninvalid\ninvalid\ninvalid\n')
+    with sqlite3.connect(':memory:') as conn:
+        conn.executescript('''
+            CREATE TABLE cursor (id INTEGER PRIMARY KEY, device INTEGER, inode INTEGER, offset INTEGER);
+            CREATE TABLE pending (id TEXT PRIMARY KEY, interval_end INTEGER, payload BLOB);
+        ''')
+        aggregate(conn, path, service, minute, 1000)
+        batch = json.loads(conn.execute('SELECT payload FROM pending').fetchone()[0])
+    assert len(batch['security_signals']) == 6
+    batch['events'] = [row for row in batch['events'] if row['status'] != 503]
+    batch['omitted_details'] = 10
+    payload = json.dumps(batch).encode()
+    headers = {'X-SIEM-Service': service, 'X-SIEM-Signature': hmac.digest(key.encode(), payload, 'sha256').hex()}
+    with TestClient(create_app(config)) as client:
+        db = client.app.state.database
+        try:
+            endpoint = '/api/v1/web-services/batches'
+            response = client.post(endpoint, content=payload, headers=headers)
+            assert response.status_code == 202, response.text
+            assert client.post(endpoint, content=payload, headers=headers).json()['duplicate']
+            rows = client.get('/api/v1/alerts', params={'domain': 'web'}).json()['items']
+            assert len(rows) == 10
+            by_category = {row['owasp_category']: row for row in rows}
+            assert set(by_category) == {f'A{n:02}' for n in range(1, 11)}
+            evaluation = client.post('/api/v1/alerts/owasp/evaluate', params={'service': service})
+            assert evaluation.status_code == 200, evaluation.text
+            assert evaluation.json()['alerts_created'] == 0
+            assert client.post('/api/v1/alerts/owasp/evaluate', params={'service': 'unknown'}).status_code == 404
+            assert by_category['A10']['evidence']['observed_count'] == 10
+            assert by_category['A10']['evidence']['web_record_ids'] == []
+            for category, expected in (('A01', 'web-records'), ('A05', 'web_security_signals'),
+                                       ('A09', 'web_service_batches'), ('A10', 'web_service_batches')):
+                alert_id = by_category[category]['id']
+                result = client.get(f'/api/v1/alerts/{alert_id}/evidence').json()['items']
+                assert any(item['collection'] == expected and item['record'] for item in result)
+            check_collectors(db, (service,), now + timedelta(minutes=6))
+            missing = db.siem_alerts.find_one({'owasp_category': 'A09', 'evidence.signal': 'missing_heartbeat'})
+            assert missing and missing['evidence']['silent_seconds'] >= 300
+        finally:
+            db.client.drop_database(config.mongodb_database)

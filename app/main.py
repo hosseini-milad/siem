@@ -29,7 +29,8 @@ from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, 
                                           SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
-from app.services.web_alerts import COOLDOWNS
+from app.services.owasp_signals import COLLECTION as WEB_SECURITY_SIGNALS
+from app.services.web_alerts import COOLDOWNS, monitor_collectors
 from app.services.web_access import WebAccessLog, access_log_handler, local_web_collector
 from app.services.system_log_ml import AGENT_LOG_LABELS, SystemLogModelManager
 
@@ -62,6 +63,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 web_records.create_index([('service', 1), ('security_event', 1), ('status', 1), ('timestamp', -1)])
                 web_records.create_index([('service', 1), ('status', 1), ('timestamp', -1)])
                 app.state.database[COOLDOWNS].create_index('last_triggered_at', expireAfterSeconds=web_services.RETENTION)
+                signals = app.state.database[WEB_SECURITY_SIGNALS]
+                signals.create_index('received_at', expireAfterSeconds=web_services.RETENTION)
+                signals.create_index([('service', 1), ('signal', 1), ('timestamp', -1)])
                 if config.auth_required:
                     initialize_access(app.state.database)
                 interrupted = app.state.database.normalization_runs.update_many(
@@ -144,7 +148,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
                 app.state.database.siem_rules.create_index("enabled")
             await run_in_threadpool(initialize)
-            async with local_web_collector(config):
+            async with (local_web_collector(config),
+                        monitor_collectors(app.state.database, tuple(config.web_collector_keys))):
                 if config.raw_log_port:
                     async with listen_for_raw_logs(app.state.database, config.raw_log_host, config.raw_log_port):
                         yield

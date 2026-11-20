@@ -42,6 +42,14 @@ class WebAlertRule(StrictBody):
 class WebAlertSettings(StrictBody):
     login_failure: WebAlertRule
     server_error: WebAlertRule
+    access_denied: WebAlertRule | None = None
+    configuration: WebAlertRule | None = None
+    supply_chain: WebAlertRule | None = None
+    cryptography: WebAlertRule | None = None
+    injection: WebAlertRule | None = None
+    business_design: WebAlertRule | None = None
+    integrity: WebAlertRule | None = None
+    logging_health: WebAlertRule | None = None
 
 
 class AlertUpdate(StrictBody):

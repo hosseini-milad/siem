@@ -26,6 +26,10 @@ SECURITY_EVENTS = {'login_success', 'login_failure', 'access_denied', 'permissio
 MEDIA_TYPES = {'application/json', 'application/problem+json', 'application/x-www-form-urlencoded',
                'application/octet-stream', 'multipart/form-data', 'text/plain', 'text/html', 'text/css'}
 BODY_FIELDS = {'id', 'batch_id', 'events', 'items', 'count', 'status', 'code', 'error', 'detail', 'limit', 'offset'}
+OWASP_SIGNALS = {
+    'configuration_policy_failed', 'supply_chain_policy_failed', 'crypto_policy_failed',
+    'injection_blocked', 'business_policy_failed', 'integrity_check_failed',
+}
 SOURCE_PATTERN = r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}'
 MAX_LINE = 16 * 1024
 MAX_OUTBOX = 64 * 1024 * 1024
@@ -41,6 +45,15 @@ def sanitize(line):
     if not isinstance(row, dict):
         raise ValueError('request log must be an object')
     timestamp = datetime.fromisoformat(row['timestamp'])
+    if 'signal' in row:
+        signal = row['signal']
+        identity = row['signal_id']
+        detector = row['detector_id']
+        if (timestamp.utcoffset() is None or signal not in OWASP_SIGNALS
+                or not all(re.fullmatch(r'[a-zA-Z0-9_.:-]{1,80}', value) for value in (identity, detector))):
+            raise ValueError('invalid security signal')
+        return {'timestamp': timestamp.astimezone(timezone.utc).isoformat(), 'signal': signal,
+                'signal_id': identity, 'detector_id': detector}
     request_id, method, route = (row[key] for key in ('request_id', 'method', 'route'))
     status, duration = row['status'], row['duration_ms']
     sizes = {key: row[key] for key in ('request_bytes', 'response_bytes')}
@@ -109,7 +122,7 @@ def aggregate(db, path, service, end, slow_ms, *, heartbeat=False):
         return
     classes, codes = Counter(), Counter()
     buckets = [0] * (len(BOUNDS) + 1)
-    critical, regular = [], []
+    critical, regular, signals = [], [], []
     invalid = 0
     checkpoint = None
     for stream, identity, offset in open_current(db, path):
@@ -133,6 +146,12 @@ def aggregate(db, path, service, end, slow_ms, *, heartbeat=False):
             except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
                 invalid += 1
                 continue
+            if 'signal' in event:
+                if len(signals) < 100:
+                    signals.append(event)
+                else:
+                    invalid += 1
+                continue
             status, duration = event['status'], event['duration_ms']
             classes[f'{status // 100}xx'] += 1
             codes[str(status)] += 1
@@ -146,7 +165,7 @@ def aggregate(db, path, service, end, slow_ms, *, heartbeat=False):
     with db:
         if checkpoint:
             db.execute('INSERT OR REPLACE INTO cursor VALUES (1, ?, ?, ?)', checkpoint)
-        if not heartbeat and not codes and not invalid:
+        if not heartbeat and not codes and not invalid and not signals:
             return
         events = (critical + regular)[:300]
         identifier = str(uuid4())
@@ -155,7 +174,7 @@ def aggregate(db, path, service, end, slow_ms, *, heartbeat=False):
             'interval_start': (end - timedelta(minutes=1)).isoformat(), 'interval_end': end.isoformat(),
             'status_classes': classes, 'status_codes': codes, 'latency_buckets': buckets,
             'omitted_details': sum(codes.values()) - len(events), 'invalid_lines': invalid,
-            'events': events,
+            'events': events, 'security_signals': signals,
         }, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
         db.execute('INSERT INTO pending VALUES (?, ?, ?)', (identifier, end.timestamp(), payload))
 
@@ -177,7 +196,7 @@ def flush(db, opener, target, service, secret):
                     batch = json.loads(payload)
                     total = sum(batch['status_codes'].values())
                     print(f"{service}: HTTP 202, batch={identifier}, requests={total}, "
-                          f"details={len(batch['events'])}, invalid_lines={batch['invalid_lines']}, "
+                          f"details={len(batch['events'])}, signals={len(batch.get('security_signals', []))}, invalid_lines={batch['invalid_lines']}, "
                           f"duplicate={receipt.get('duplicate', False)}", flush=True)
             except (HTTPError, URLError, OSError, ValueError) as error:
                 print(f'batch {identifier} kept for retry: {error}', file=sys.stderr)
