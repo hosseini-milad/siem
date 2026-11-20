@@ -14,6 +14,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 from app.db.session import DB
+from app.services.web_access import INGEST_PATH
 from app.services.access import (COOKIE, SECTIONS, SESSION_SECONDS, allowed, now,
                                  password_hash, password_matches, public_user, token_digest)
 
@@ -38,7 +39,7 @@ PREFIX = {
     'overview': 'overview', 'dashboard': 'overview', 'logs': 'ingestion', 'ingestion': 'ingestion',
     'search': 'events', 'explorer': 'explorer', 'detections': 'detections', 'alerts': 'alerts',
     'incidents': 'incidents', 'datasets': 'analytics', 'system-log-datasets': 'analytics',
-    'system-log-ml': 'analytics', 'normalization': 'analytics',
+    'web-services': 'system', 'system-log-ml': 'analytics', 'normalization': 'analytics',
     'standardization': 'analytics', 'ml': 'analytics', 'system': 'system', 'systems': 'systems',
     'users': 'users', 'device-health': 'device-health', 'tasks': 'tasks', 'task-columns': 'task-columns',
 }
@@ -68,7 +69,7 @@ def authorize(request: Request):
     if write and (request.headers.get('sec-fetch-site') == 'cross-site' or
                   (origin is not None and origin not in {f'http://{host}', f'https://{host}'})):
         raise HTTPException(403, 'مبدأ درخواست مجاز نیست.')
-    if path in PUBLIC or not request.app.state.settings.auth_required:
+    if path in PUBLIC or (path == INGEST_PATH and request.method == 'POST') or not request.app.state.settings.auth_required:
         return
     if path == '/logs' and request.method == 'POST':
         token = request.app.state.settings.http_log_token
@@ -468,7 +469,7 @@ def create_user(body: NewUser, user: User, database: DB):
 
 
 @router.patch('/users/{user_id}')
-def update_user(user_id: str, body: UserUpdate, user: User, database: DB):
+def update_user(user_id: str, body: UserUpdate, user: User, database: DB, request: Request):
     scope = account_scope(user)
     if not allowed(user, 'users', write=True):
         raise HTTPException(403, 'ویرایش حساب مجاز نیست.')
@@ -507,4 +508,6 @@ def update_user(user_id: str, body: UserUpdate, user: User, database: DB):
         raise HTTPException(409, 'نام کاربری قبلاً ثبت شده است.') from exc
     if not updated:
         raise HTTPException(404, 'کاربر سازگار با این عملیات پیدا نشد.')
+    if body.permissions is not None:
+        request.state.web_security_event = 'permission_changed'
     return public_user(updated)

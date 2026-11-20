@@ -7,7 +7,7 @@ from pymongo.errors import ExecutionTimeout, PyMongoError
 
 from app.db.session import DB
 from app.schemas.log import LogLevel
-from app.services.explorer import list_records, list_system_records
+from app.services.explorer import list_records, list_system_records, list_web_records
 
 logger = logging.getLogger('uvicorn.error.siem.explorer')
 router = APIRouter(prefix='/api/v1/explorer', tags=['Search'])
@@ -54,5 +54,30 @@ def system_records(
         raise HTTPException(422, 'start must be earlier than end')
     try:
         return list_system_records(database, start, end, q.strip(), label, limit, offset)
+    except ExecutionTimeout as exc:
+        raise HTTPException(503, 'Explorer query timed out. Try a smaller date range.') from exc
+
+
+class WebRecordFilters(BaseModel):
+    start: AwareDatetime | None = None
+    end: AwareDatetime | None = None
+    service: str | None = Field(None, pattern=r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$')
+    request_id: str | None = Field(None, pattern=r'^[a-zA-Z0-9_.:-]{1,80}$')
+    route: str | None = Field(None, max_length=200, pattern=r'^[^?#\x00]*$')
+    method: Literal['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'CONNECT', 'TRACE', 'OTHER'] | None = None
+    status: int | None = Field(None, ge=100, le=599)
+    source_ip: str | None = Field(None, max_length=45)
+    min_duration_ms: float | None = Field(None, ge=0, allow_inf_nan=False)
+    min_response_bytes: int | None = Field(None, ge=0, le=1000000000)
+    limit: int = Field(15, ge=1, le=100)
+    offset: int = Field(0, ge=0)
+
+
+@router.get('/web-records', summary='کاوش لاگ درخواست‌های وب‌سرویس')
+def web_records(database: DB, filters: Annotated[WebRecordFilters, Query()]):
+    if filters.start and filters.end and filters.start >= filters.end:
+        raise HTTPException(422, 'start must be earlier than end')
+    try:
+        return list_web_records(database, filters)
     except ExecutionTimeout as exc:
         raise HTTPException(503, 'Explorer query timed out. Try a smaller date range.') from exc

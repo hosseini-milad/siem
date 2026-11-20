@@ -4,7 +4,8 @@ from ipaddress import ip_address
 import math
 import re
 
-from app.models.log import COLLECTION
+from app.models.log import COLLECTION, public_document
+from app.services.web_access import RECORDS as WEB_RECORDS
 from app.services.agent_ingestion import AGENT_LOGS
 from app.services.system_log_ml import AGENT_LOG_LABELS
 
@@ -220,3 +221,21 @@ def list_system_records(database, start, end, query, label, limit, offset):
         row['raw'] = raw.get(row['id'])
         row['event_id'] = (row['raw'] or {}).get('event_id')
     return {'items': items, 'total': total, 'limit': limit, 'offset': offset}
+
+
+def list_web_records(database, filters):
+    query = {key: value for key in ('service', 'request_id', 'method', 'status', 'source_ip')
+             if (value := getattr(filters, key)) is not None}
+    dates = {op: value for op, value in (('$gte', filters.start), ('$lt', filters.end)) if value is not None}
+    if dates:
+        query['timestamp'] = dates
+    if filters.route:
+        query['route'] = {'$regex': '^' + re.escape(filters.route)}
+    for key, value in (('duration_ms', filters.min_duration_ms), ('response_bytes', filters.min_response_bytes)):
+        if value is not None:
+            query[key] = {'$gte': value}
+    collection = database[WEB_RECORDS]
+    total = collection.count_documents(query, maxTimeMS=TIMEOUT_MS)
+    with collection.find(query).sort(LOG_ORDER).skip(filters.offset).limit(filters.limit).max_time_ms(TIMEOUT_MS) as cursor:
+        items = [public_document(row) for row in cursor]
+    return {'items': items, 'total': total, 'limit': filters.limit, 'offset': filters.offset}

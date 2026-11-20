@@ -3,7 +3,7 @@ from threading import Lock
 from datetime import datetime, timezone
 import logging
 
-from app.api import access, alerts, dashboard, detections, explorer, incidents, ingestion, search, system, tasks
+from app.api import access, alerts, dashboard, detections, explorer, incidents, ingestion, search, system, tasks, web_services
 
 from app.api.machine_learning import router as machine_learning_router
 from app.services.machine_learning import ModelManager
@@ -29,11 +29,13 @@ from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, 
                                           SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
+from app.services.web_access import WebAccessLog, access_log_handler
 from app.services.system_log_ml import AGENT_LOG_LABELS, SystemLogModelManager
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     config = settings or Settings()
+    access_handler = access_log_handler(config.web_access_log_path) if config.web_access_log_path else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -46,6 +48,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             def initialize():
                 client.admin.command("ping")
+                batches = app.state.database[web_services.COLLECTION]
+                batches.create_index('received_at', expireAfterSeconds=web_services.RETENTION)
+                batches.create_index([('interval_end', -1), ('_id', -1)])
+                batches.create_index([('service', 1), ('interval_end', -1), ('_id', -1)])
+                web_records = app.state.database[web_services.RECORDS]
+                web_records.create_index('received_at', expireAfterSeconds=web_services.RETENTION)
+                web_records.create_index(LOG_ORDER)
+                web_records.create_index([('service', 1), *LOG_ORDER])
+                web_records.create_index([('status', 1), *LOG_ORDER])
                 if config.auth_required:
                     initialize_access(app.state.database)
                 interrupted = app.state.database.normalization_runs.update_many(
@@ -130,6 +141,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 yield
         finally:
             client.close()
+            if access_handler is not None:
+                access_handler.close()
 
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
                   description="SIEM هوشمند: رویدادها، هشدارها، قواعد، رخدادها، جست‌وجوی MongoDB و مدل‌های LightGBM/CatBoost. با احراز هویت و کنترل دسترسی.",
@@ -137,6 +150,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}, {"name": "Tasks"}],
                   swagger_ui_parameters={"displayRequestDuration": True, "docExpansion": "none"},
                   responses={503: {"description": "MongoDB operation unavailable; batch writes may be partial"}})
+    if access_handler is not None:
+        app.add_middleware(WebAccessLog, handler=access_handler)
     app.state.settings = config
     app.state.import_lock = Lock()
     app.include_router(access.router)
@@ -148,7 +163,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(normalization_router)
     app.include_router(standardization_router)
     app.include_router(machine_learning_router)
-    for module in (ingestion, search, explorer, dashboard, detections, alerts, incidents, system, tasks):
+    for module in (ingestion, search, explorer, dashboard, detections, alerts, incidents, system, tasks, web_services):
         app.include_router(module.router)
 
     @app.exception_handler(RequestValidationError)

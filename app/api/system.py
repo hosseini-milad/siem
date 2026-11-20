@@ -13,9 +13,7 @@ MENUS = (
     ('overview', 'نمای کلی', ('Overview',)),
     ('ingestion', 'ورود و پردازش', ('Ingestion', 'Logs')),
     ('events', 'جست‌وجوی رویدادها', ('Search',)),
-    ('detections', 'قواعد تشخیص', ('Detection Rules',)),
     ('alerts', 'هشدارها', ('Alerts',)),
-    ('incidents', 'رخدادهای امنیتی', ('Incidents',)),
     ('analytics', 'تحلیل هوشمند', ('Datasets', 'Normalization', 'Standardization', 'Machine Learning', SYSTEM_LOG_ML_TAG['name'])),
     ('system', 'سامانه', ('System', 'Health')),
 )
@@ -38,7 +36,7 @@ TAG_DESCRIPTIONS = {
 }
 
 OPENAPI_TAGS = [{'name': tag, 'description': TAG_DESCRIPTIONS[tag]}
-                for _, _, tags in MENUS for tag in tags]
+                for tag in [*(tag for _, _, tags in MENUS for tag in tags), 'Detection Rules', 'Incidents']]
 
 
 @router.get('/system/navigation', tags=['System'], summary='منوی پنل و ترتیب تگ‌های Swagger')

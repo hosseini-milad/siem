@@ -16,5 +16,7 @@ class Settings(BaseSettings):
     raw_log_host: str = "127.0.0.1"
     raw_log_port: int = Field(default=0, ge=0, le=65535)
     http_log_token: SecretStr | None = None
+    web_access_log_path: str | None = None
+    web_collector_keys: dict[str, SecretStr] = Field(default_factory=dict)
     auth_required: bool = True
     session_cookie_secure: bool = True

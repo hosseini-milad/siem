@@ -40,7 +40,7 @@ def test_operational_menu_tags(setup):
     assert not spec.get('security') and not spec.get('components', {}).get('securitySchemes')
     menu = client.get('/api/v1/system/navigation').json()
     assert not menu['authentication'] and not menu['agents_in_scope']
-    assert [tag for item in menu['menus'] for tag in item['tags']] == [item['name'] for item in spec['tags'] if item['name'] not in {'Access', 'Tasks'}]
+    assert [tag for item in menu['menus'] for tag in item['tags']] == [item['name'] for item in spec['tags'] if item['name'] not in {'Access', 'Tasks', 'Detection Rules', 'Incidents'}]
     assert client.get(menu['dashboard_path']).status_code == 200
     settings = client.get('/api/v1/system/settings').json()
     assert settings['mongodb_database'] == db.name
