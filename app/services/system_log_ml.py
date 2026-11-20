@@ -29,6 +29,7 @@ NORMAL_RUNS = "system_log_normalization_runs"
 TRAINING_RUNS = "system_log_training_runs"
 MODELS = "system_log_models"
 MODEL_FILES = "system_log_model_files"
+AGENT_LOG_LABELS = "agent_logs_label"
 NORMALIZATION_VERSION = 2
 NORMAL_PARAMETERS = "system_log_normalization_parameters"
 SCALER_ID = f"minmax-v{NORMALIZATION_VERSION}"
@@ -455,12 +456,16 @@ class SystemLogPredictor:
         self.light = light
         self.cat = cat
 
+    def standardize(self, records):
+        bounds = self.manifest.get("numeric_bounds")
+        return matrix([normalize_row(row, require_label=False, bounds=bounds) for row in records])
+
     def predict(self, records):
         if not records:
             return []
-        bounds = self.manifest.get("numeric_bounds")
-        normalized = [normalize_row(row, require_label=False, bounds=bounds) for row in records]
-        values = matrix(normalized)
+        return self.predict_features(records, self.standardize(records))
+
+    def predict_features(self, records, values):
         classes = len(self.manifest["labels"])
         light_values = probabilities(self.light, values, classes)
         cat_values = probabilities(self.cat, values, classes)
@@ -521,17 +526,33 @@ def predict_and_store(database, manager, records):
         predictor = manager.require()
     except LookupError:
         return []
-    predictions = predictor.predict(records)
-    if predictions:
-        now = datetime.now(timezone.utc)
-        database.agent_logs.bulk_write([
-            UpdateOne({"_id": item["original_id"]}, {"$set": {
-                "predicted_label": item["predicted_label"],
-                "prediction_confidence": item["prediction_confidence"],
-                "label_probabilities": item["label_probabilities"],
-                "model_id": item["model_id"], "predicted_at": now,
-            }}) for item in predictions
-        ])
+    predictions = []
+    for start in range(0, len(records), BATCH_SIZE):
+        batch = records[start:start + BATCH_SIZE]
+        features = predictor.standardize(batch)
+        items = predictor.predict_features(batch, features)
+        predicted_at = datetime.now(timezone.utc)
+        labeled_writes = []
+        raw_writes = []
+        for record, values, item in zip(batch, features, items):
+            identifier = record["_id"]
+            prediction = {
+                key: item[key] for key in (
+                    "predicted_label", "prediction_confidence", "label_probabilities", "model_id")
+            }
+            prediction["predicted_at"] = predicted_at
+            labeled = {
+                "_id": identifier, "original_id": identifier, "agent_id": record["agent_id"],
+                "timestamp": record["timestamp"], "received_at": record["received_at"],
+                "normalization_version": predictor.manifest["normalization_version"],
+                "features": dict(zip(FEATURES, values.tolist())),
+                **prediction,
+            }
+            labeled_writes.append(ReplaceOne({"_id": identifier}, labeled, upsert=True))
+            raw_writes.append(UpdateOne({"_id": identifier}, {"$set": prediction}))
+        database[AGENT_LOG_LABELS].bulk_write(labeled_writes, ordered=False)
+        database.agent_logs.bulk_write(raw_writes, ordered=False)
+        predictions.extend(items)
     return predictions
 
 

@@ -183,3 +183,18 @@ def test_training_stores_feature_weights_evaluation_and_model_artifact(setup):
     assert scored["predicted_label"] == "2" and scored["model_id"] == metadata["_id"]
     assert 0 <= scored["prediction_confidence"] <= 1
     assert len(scored["label_probabilities"]) == 3
+
+    labeled = database.agent_logs_label.find_one({"_id": scored["_id"]})
+    assert labeled["original_id"] == scored["_id"]
+    assert labeled["predicted_label"] == "2" and labeled["model_id"] == metadata["_id"]
+    assert labeled["normalization_version"] == NORMALIZATION_VERSION
+    assert labeled["agent_id"] == "host-1" and labeled["timestamp"] == scored["timestamp"]
+    assert set(labeled["features"]) == set(FEATURES)
+    assert labeled["features"]["num_event_id"] == 1
+    assert list(labeled["features"].values()) == predictor.standardize([scored])[0].tolist()
+
+    database.agent_logs_label.delete_one({"_id": scored["_id"]})
+    repeated = client.post("/logs", json=payload)
+    assert repeated.status_code == 201 and repeated.json()["inserted"] == 0
+    assert database.agent_logs_label.count_documents({}) == 1
+    assert database.agent_logs_label.find_one({"_id": scored["_id"]})["predicted_label"] == "2"

@@ -12,7 +12,7 @@ SECTIONS = {
     'users': 'کاربران', 'tasks': 'تسک‌ها', 'task-columns': 'مدیریت ستون تسک‌ها',
 }
 COOKIE = 'siem_session'
-SESSION_SECONDS = 8 * 60 * 60
+SESSION_SECONDS = 7 * 24 * 60 * 60
 password_slots = BoundedSemaphore(2)
 
 

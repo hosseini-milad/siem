@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -44,6 +44,10 @@ def test_roles_grants_and_session_revocation(application):
     signed_in = login(manager, 'manager')
     assert signed_in.status_code == 200, signed_in.text
     assert 'HttpOnly' in signed_in.headers['set-cookie'] and 'Secure' in signed_in.headers['set-cookie']
+    assert 'Max-Age=604800' in signed_in.headers['set-cookie']
+    session = app.state.database.sessions.find_one({'_id': token_digest(manager.cookies[COOKIE])})
+    remaining = session['expires_at'] - datetime.now(timezone.utc)
+    assert timedelta(days=7, seconds=-5) < remaining <= timedelta(days=7)
     assert manager.get('/api/v1/auth/me').json()['role'] == 'manager'
     assert manager.get('/api/v1/overview').status_code == 200
     admin_data = {'username': 'operator', 'name': 'Operator', 'password': PASSWORD,
