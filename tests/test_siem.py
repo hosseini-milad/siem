@@ -89,6 +89,12 @@ def test_threshold_rules_and_ml_alerts_are_deduplicated(setup, monkeypatch):
     assert client.post('/api/v1/alerts/from-predictions', json={}).json()['deduplicated'] == 1
     assert db.siem_alerts.count_documents({}) == 2
     assert db.ml_predictions.count_documents({}) == 2
+    db.dataset_records.insert_one({'_id': 'raw-a', 'Protocol': 'TCP'})
+    db.standard_records.insert_one({'_id': 'std-a', 'original_id': 'raw-a'})
+    alert_id = db.siem_alerts.find_one({'kind': 'ml'})['_id']
+    evidence = client.get('/api/v1/alerts/' + alert_id + '/evidence').json()['items']
+    assert [item['collection'] for item in evidence] == ['ml_predictions', 'standard_records', 'dataset_records']
+    assert evidence[-1]['record']['Protocol'] == 'TCP'
     assert client.get('/api/v1/overview').json()['event_count'] == 3
 
 
@@ -141,3 +147,39 @@ def test_native_search_and_charts_include_legacy_and_new_events(setup):
     assert client.get('/api/v1/search/events', params={'start': '2020-01-01T00:00:00Z'}).status_code == 422
     window = {'start': '2020-01-02T00:00:00Z', 'end': '2020-01-01T00:00:00Z'}
     assert client.get('/api/v1/dashboard/charts', params=window).status_code == 422
+
+
+def test_alert_domains_trace_evidence_and_show_live_pipeline_counts(setup):
+    client, db = setup
+    event_id = client.post('/api/v1/logs', json=event()).json()['id']
+    network = client.post('/api/v1/alerts', json={
+        'title': 'Network', 'description': 'Network evidence', 'event_ids': [event_id],
+    }).json()
+    log_id = 'a' * 64
+    db.agent_logs.insert_one({'_id': log_id, 'message': 'System evidence'})
+    db.agent_logs_label.insert_one({'_id': log_id, 'agent_id': 'host-1', 'predicted_label': '2',
+                                   'prediction_confidence': .98, 'model_id': 'sysmon', 'features': {'event': 1}})
+    payload = {'log_id': log_id, 'title': 'System', 'description': 'Analyst reviewed', 'severity': 'high'}
+    created = client.post('/api/v1/alerts/from-system-log', json=payload)
+    assert created.status_code == 200
+    system = created.json()
+    assert client.post('/api/v1/alerts/from-system-log', json=payload).json()['id'] == system['id']
+    network_items = client.get('/api/v1/alerts', params={'domain': 'network'}).json()['items']
+    system_items = client.get('/api/v1/alerts', params={'domain': 'system'}).json()['items']
+    assert [row['id'] for row in network_items] == [network['id']]
+    assert [row['id'] for row in system_items] == [system['id']]
+    stats = client.get('/api/v1/alerts/summary', params={'domain': 'system', 'days': 7}).json()
+    assert stats['total'] == stats['severities']['high'] == 1
+    assert len(stats['series']) == 7 and sum(row['count'] for row in stats['series']) == 1
+    prefix = '/api/v1/alerts/'
+    network_evidence = client.get(prefix + network['id'] + '/evidence').json()['items']
+    assert network_evidence[0]['record']['id'] == event_id
+    system_path = prefix + system['id']
+    system_evidence = client.get(system_path + '/evidence').json()['items']
+    assert [row['collection'] for row in system_evidence] == ['agent_logs_label', 'agent_logs']
+    assert system_evidence[0]['record']['features'] == {'event': 1}
+    assert system_evidence[1]['record']['message'] == 'System evidence'
+    assert client.patch(system_path, json={'status': 'acknowledged'}).json()['status'] == 'acknowledged'
+    assert client.get('/api/v1/system/pipelines').json()['system']['labeled_logs'] == 1
+    db.agent_logs.delete_one({'_id': log_id})
+    assert client.get(system_path + '/evidence').json()['items'][1]['record'] is None

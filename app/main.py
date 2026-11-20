@@ -10,7 +10,7 @@ from app.services.machine_learning import ModelManager
 from app.api.standardization import router as standardization_router
 from app.api.datasets import router as datasets_router
 from app.api.system_log_datasets import router as system_log_datasets_router
-from app.api.system_log_ml import TAG as SYSTEM_LOG_ML_TAG, router as system_log_ml_router
+from app.api.system_log_ml import router as system_log_ml_router
 from app.api.normalization import router as normalization_router
 
 from fastapi import Depends, FastAPI, Request
@@ -118,6 +118,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     logging.getLogger('uvicorn.error.siem.system_log_ml').exception(
                         'Active system-log model could not be loaded; retrain before prediction')
                 app.state.database.siem_alerts.create_index([("status", 1), ("severity", 1), ("created_at", -1)])
+                app.state.database.siem_alerts.create_index([("created_at", -1), ("_id", -1)])
+                app.state.database.siem_alerts.create_index([("domain", 1), ("created_at", -1), ("_id", -1)])
                 app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
                 app.state.database.siem_rules.create_index("enabled")
             await run_in_threadpool(initialize)
@@ -132,7 +134,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="SIEM API", version="0.1.0", lifespan=lifespan,
                   description="SIEM هوشمند: رویدادها، هشدارها، قواعد، رخدادها، جست‌وجوی MongoDB و مدل‌های LightGBM/CatBoost. با احراز هویت و کنترل دسترسی.",
                   dependencies=[Depends(access.authorize)],
-                  openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}, {"name": "Tasks"}, SYSTEM_LOG_ML_TAG],
+                  openapi_tags=[*system.OPENAPI_TAGS, {"name": "Access"}, {"name": "Tasks"}],
                   swagger_ui_parameters={"displayRequestDuration": True, "docExpansion": "none"},
                   responses={503: {"description": "MongoDB operation unavailable; batch writes may be partial"}})
     app.state.settings = config

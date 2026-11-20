@@ -24,6 +24,13 @@ class AlertCreate(StrictBody):
     event_ids: list[UUID] = Field(default_factory=list, max_length=100)
 
 
+class SystemAlertCreate(StrictBody):
+    log_id: str = Field(pattern=r'^[a-f0-9]{64}$')
+    title: Name
+    description: Description
+    severity: Severity = 'medium'
+
+
 class AlertUpdate(StrictBody):
     status: AlertStatus
 

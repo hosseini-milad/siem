@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Request, Response
 
+from app.api.system_log_ml import TAG as SYSTEM_LOG_ML_TAG
 from app.db.session import DB
+from app.models.log import RETENTION_SECONDS
 from app.services.access import SECTIONS, allowed
+from app.services.agent_ingestion import AGENT_LOGS
+from app.services.system_log_ml import AGENT_LOG_LABELS
 
 router = APIRouter(prefix='/api/v1')
 
@@ -12,7 +16,7 @@ MENUS = (
     ('detections', 'قواعد تشخیص', ('Detection Rules',)),
     ('alerts', 'هشدارها', ('Alerts',)),
     ('incidents', 'رخدادهای امنیتی', ('Incidents',)),
-    ('analytics', 'تحلیل هوشمند', ('Datasets', 'Normalization', 'Standardization', 'Machine Learning')),
+    ('analytics', 'تحلیل هوشمند', ('Datasets', 'Normalization', 'Standardization', 'Machine Learning', SYSTEM_LOG_ML_TAG['name'])),
     ('system', 'سامانه', ('System', 'Health')),
 )
 
@@ -30,6 +34,7 @@ TAG_DESCRIPTIONS = {
     'Machine Learning': 'آموزش، ارزیابی و پیش‌بینی',
     'System': 'منو، تنظیمات و وضعیت مؤلفه‌ها',
     'Health': 'سلامت اتصال MongoDB',
+    SYSTEM_LOG_ML_TAG['name']: SYSTEM_LOG_ML_TAG['description'],
 }
 
 OPENAPI_TAGS = [{'name': tag, 'description': TAG_DESCRIPTIONS[tag]}
@@ -71,14 +76,45 @@ def settings(request: Request):
 @router.get('/system/status', tags=['System'], summary='وضعیت اتصال MongoDB و آمادگی مدل')
 def status(request: Request, database: DB):
     database.command('ping')
-    try:
-        request.app.state.ml.require()
-    except LookupError:
-        model_ready = False
-    else:
-        model_ready = True
-    return {'mongodb': {'available': True}, 'machine_learning': {'available': model_ready}}
+    return {
+        'mongodb': {'available': True},
+        'machine_learning': {'available': model_available(request.app.state.ml)},
+    }
 
+
+def model_available(manager):
+    try:
+        manager.require()
+    except LookupError:
+        return False
+    return True
+
+
+@router.get('/system/pipelines', tags=['System'], summary='سلامت و شاخص‌های مسیر شبکه و سیستم‌ها')
+def pipelines(request: Request, database: DB):
+    database.command('ping')
+    latest_event = database.log_events.find_one(
+        {}, {'received_at': 1}, sort=[('received_at', -1)])
+    latest_agent = database[AGENT_LOGS].find_one(
+        {}, {'received_at': 1}, sort=[('received_at', -1)])
+    return {
+        'database_available': True,
+        'retention_days': RETENTION_SECONDS // 86400,
+        'network': {
+            'model_ready': model_available(request.app.state.ml),
+            'dataset_records': database.dataset_records.estimated_document_count(),
+            'standardized_records': database.standard_records.estimated_document_count(),
+            'predictions': database.ml_predictions.estimated_document_count(),
+            'last_received_at': (latest_event or {}).get('received_at'),
+        },
+        'system': {
+            'model_ready': model_available(request.app.state.system_log_ml),
+            'agent_logs': database[AGENT_LOGS].estimated_document_count(),
+            'labeled_logs': database[AGENT_LOG_LABELS].estimated_document_count(),
+            'registered_systems': database.systems.estimated_document_count(),
+            'last_received_at': (latest_agent or {}).get('received_at'),
+        },
+    }
 
 @router.get('/health', tags=['Health'], summary='بررسی اتصال دیتابیس')
 def health(database: DB):
