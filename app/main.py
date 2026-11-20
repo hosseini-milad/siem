@@ -29,7 +29,7 @@ from app.services.agent_ingestion import (AGENT_LOGS, PAYLOADS, SYSTEM_METRICS, 
                                           SYSTEM_CHANGES, bootstrap_systems)
 from app.services.explorer import DATASET_IP_COLUMNS, DATASET_ORDER, LOG_ORDER
 from app.services.raw_logs import listen_for_raw_logs
-from app.services.web_access import WebAccessLog, access_log_handler
+from app.services.web_access import WebAccessLog, access_log_handler, local_web_collector
 from app.services.system_log_ml import AGENT_LOG_LABELS, SystemLogModelManager
 
 
@@ -110,6 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database[PAYLOADS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 app.state.database[PAYLOADS].create_index([("agent_id", 1), ("timestamp", -1)])
                 app.state.database[AGENT_LOGS].create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
+                app.state.database[AGENT_LOGS].create_index(LOG_ORDER)
                 labeled_logs = app.state.database[AGENT_LOG_LABELS]
                 labeled_logs.create_index("received_at", expireAfterSeconds=RETENTION_SECONDS)
                 labeled_logs.create_index(LOG_ORDER)
@@ -134,11 +135,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.database.siem_incidents.create_index([("status", 1), ("created_at", -1)])
                 app.state.database.siem_rules.create_index("enabled")
             await run_in_threadpool(initialize)
-            if config.raw_log_port:
-                async with listen_for_raw_logs(app.state.database, config.raw_log_host, config.raw_log_port):
+            async with local_web_collector(config):
+                if config.raw_log_port:
+                    async with listen_for_raw_logs(app.state.database, config.raw_log_host, config.raw_log_port):
+                        yield
+                else:
                     yield
-            else:
-                yield
         finally:
             client.close()
             if access_handler is not None:

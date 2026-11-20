@@ -3,6 +3,7 @@
 import argparse
 from bisect import bisect_left
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hmac
 import ipaddress
@@ -201,7 +202,14 @@ def main():
         parser.error('a collector key of at least 32 bytes, valid service ID and positive slow threshold are required')
     os.umask(0o077)
     opener = build_opener(ProxyHandler({}), NoRedirect())
-    with sqlite3.connect(args.state) as db:
+    lock_path = args.state.resolve().with_suffix(args.state.suffix + '.lock')
+    with closing(sqlite3.connect(lock_path, timeout=0)) as lock, closing(sqlite3.connect(args.state)) as db:
+        try:
+            lock.execute('BEGIN EXCLUSIVE')
+        except sqlite3.OperationalError as error:
+            if error.sqlite_errorcode == sqlite3.SQLITE_BUSY:
+                parser.error('a collector is already using this state file')
+            raise
         db.executescript('''
           CREATE TABLE IF NOT EXISTS source (id INTEGER PRIMARY KEY, path TEXT, service TEXT);
           CREATE TABLE IF NOT EXISTS cursor (id INTEGER PRIMARY KEY, device INTEGER, inode INTEGER, offset INTEGER);

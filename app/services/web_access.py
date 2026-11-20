@@ -1,7 +1,13 @@
 """Export request metadata as JSON lines for an external collector."""
+import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
+import os
+from pathlib import Path
 import re
+import subprocess
+import sys
 from datetime import datetime, timezone
 from logging.handlers import WatchedFileHandler
 from time import perf_counter
@@ -140,4 +146,34 @@ class WebAccessLog:
 
 
 def access_log_handler(path):
-    return WatchedFileHandler(path, encoding='utf-8', delay=False)
+    handler = logging.FileHandler if os.name == 'nt' else WatchedFileHandler
+    return handler(path, encoding='utf-8', delay=False)
+
+
+@asynccontextmanager
+async def local_web_collector(config):
+    service = 'siem-api'
+    key = config.web_collector_keys.get(service)
+    if not config.web_local_collector_enabled or not config.web_access_log_path or key is None:
+        yield
+        return
+
+    log = logging.getLogger('uvicorn.error')
+    source = Path(config.web_access_log_path).resolve()
+    script = Path(__file__).resolve().parents[2] / 'scripts' / 'collect_web_logs.py'
+    process = subprocess.Popen([
+        sys.executable, '-u', str(script), '--source', str(source),
+        '--state', str(source.with_name('collector.sqlite')), '--service', service,
+        '--endpoint', config.web_local_collector_endpoint,
+    ], env={**os.environ, 'SIEM_WEB_COLLECTOR_KEY': key.get_secret_value()})
+    log.info('Started local SIEM web log collector (pid=%s)', process.pid)
+    try:
+        yield
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                await asyncio.to_thread(process.wait, 5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                await asyncio.to_thread(process.wait)

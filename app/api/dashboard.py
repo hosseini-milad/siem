@@ -21,6 +21,11 @@ def overview(database: DB, hours: int = Query(24, ge=1, le=720)):
     return dashboard.overview(database, hours)
 
 
+@router.get('/api/v1/overview/operations', tags=['Overview'], summary='نمای عملیات هشدار و حجم لاگ در سه مسیر')
+def operations(database: DB, hours: int = Query(24, ge=1, le=720)):
+    return dashboard.operational_overview(database, hours)
+
+
 @router.get('/api/v1/dashboard/charts', tags=['Overview'], summary='روند زمانی، سطح و منابع رویدادها')
 def charts(database: DB, query: EventFilters, interval: Literal['hour', 'day'] = 'hour'):
     return {'interval': interval, **search.statistics(database, query, interval)}

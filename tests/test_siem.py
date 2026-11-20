@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -183,3 +183,42 @@ def test_alert_domains_trace_evidence_and_show_live_pipeline_counts(setup):
     assert client.get('/api/v1/system/pipelines').json()['system']['labeled_logs'] == 1
     db.agent_logs.delete_one({'_id': log_id})
     assert client.get(system_path + '/evidence').json()['items'][1]['record'] is None
+
+
+
+def test_operational_overview_separates_alerts_logs_and_web_totals(setup):
+    client, db = setup
+    stamp = datetime.now(timezone.utc) - timedelta(minutes=2)
+    db.log_events.insert_many([
+        {'_id': 'network-log', 'timestamp': stamp, 'received_at': stamp},
+        {'_id': 'agent-mirror', 'timestamp': stamp, 'received_at': stamp, 'attributes': {'agent_id': 'host'}},
+    ])
+    db.agent_logs.insert_one({'_id': 'system-log', 'timestamp': stamp, 'received_at': stamp})
+    db.web_service_batches.insert_one({
+        'interval_start': stamp - timedelta(minutes=1), 'interval_end': stamp, 'received_at': stamp,
+        'status_codes': {'200': 20, '404': 3, '503': 2}, 'events': [{'status': 503}],
+    })
+    db.siem_alerts.insert_many([
+        {'_id': 'network-alert', 'status': 'open', 'severity': 'high', 'created_at': stamp},
+        {'_id': 'system-alert', 'domain': 'system', 'status': 'acknowledged',
+         'severity': 'medium', 'created_at': stamp},
+        {'_id': 'web-alert', 'domain': 'web', 'status': 'resolved', 'severity': 'critical', 'created_at': stamp},
+        {'_id': 'older-alert', 'domain': 'web', 'status': 'open', 'severity': 'critical',
+         'created_at': stamp - timedelta(days=2)},
+    ])
+
+    result = client.get('/api/v1/overview/operations', params={'hours': 24})
+    assert result.status_code == 200, result.text
+    data = result.json()
+    assert data['interval'] == 'hour'
+    assert data['alert_totals'] == {'network': 1, 'system': 1, 'web': 1}
+    assert data['alert_severities'] == {'critical': 1, 'high': 1, 'medium': 1, 'low': 0}
+    assert {key: value['count'] for key, value in data['sources'].items()} == {
+        'network': 1, 'system': 1, 'web': 25,
+    }
+    assert all(value['last_received_at'] for value in data['sources'].values())
+    assert data['alert_queue']['web'] == {'open': 1, 'acknowledged': 0}
+    assert sum(bucket['web'] for bucket in data['log_series']) == 25
+    assert len(data['log_series']) >= 24
+    daily = client.get('/api/v1/overview/operations', params={'hours': 168}).json()
+    assert daily['interval'] == 'day' and daily['alert_totals']['web'] == 2

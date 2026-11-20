@@ -16,7 +16,7 @@ def test_web_access_collection_and_signed_replay(tmp_path):
     secret = 'test-collector-secret-only-for-tests'
     config = Settings(mongodb_database='siem_test_' + uuid4().hex,
                       ml_model_dir=str(tmp_path / 'model'),
-                      web_access_log_path=str(path), web_collector_keys={'siem-api': secret, 'remote-api': 'another-test-key'})
+                      web_access_log_path=str(path), web_local_collector_enabled=False, web_collector_keys={'siem-api': secret, 'remote-api': 'another-test-key'})
     app = create_app(config)
     with TestClient(app) as client:
         db = app.state.database
